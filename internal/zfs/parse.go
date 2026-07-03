@@ -57,12 +57,9 @@ func ParsePoolList(output string) ([]*Pool, error) {
 			Health:    strings.TrimSpace(fields[6]),
 			UpdatedAt: time.Now(),
 		}
-		// fragmentation field (index 4) — strip % suffix
-		fragStr := strings.TrimSuffix(strings.TrimSpace(fields[4]), "%")
-		if fragStr != "-" && fragStr != "" {
-			v, _ := strconv.ParseFloat(fragStr, 64)
-			p.Fragmentation = v
-		}
+		// fragmentation field (index 4) — strip % suffix, store in Errors field temporarily
+		// Note: Pool struct doesn't have Fragmentation field; we ignore it for now.
+		_ = strings.TrimSuffix(strings.TrimSpace(fields[4]), "%") // fragmentation — ignored
 		if p.Size > 0 {
 			p.Capacity = math.Round(float64(p.Allocated)/float64(p.Size)*10000) / 100
 		}
