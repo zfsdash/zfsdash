@@ -3,8 +3,11 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -12,69 +15,286 @@ import (
 	"github.com/go-chi/cors"
 
 	"github.com/zfsdash/zfsdash/internal/alerts"
+	"github.com/zfsdash/zfsdash/internal/auth"
+	"github.com/zfsdash/zfsdash/internal/config"
 	"github.com/zfsdash/zfsdash/internal/db"
 	"github.com/zfsdash/zfsdash/internal/store"
+	"github.com/zfsdash/zfsdash/internal/wizard"
 	"github.com/zfsdash/zfsdash/internal/zfs"
 )
 
-// Handler holds dependencies for HTTP handlers
+const (
+	// sessionCookieName is the httponly cookie that carries the session token.
+	sessionCookieName = "zfsdash_session"
+	// sessionDuration controls the cookie Max-Age.
+	sessionDuration = 7 * 24 * time.Hour
+)
+
+// contextKey is a private type for context values set by this package.
+type contextKey int
+
+const (
+	ctxKeyUser contextKey = iota
+)
+
+// Handler holds dependencies for HTTP handlers.
 type Handler struct {
-	store      *store.Store
-	db         *db.DB
+	store       *store.Store
+	db          *db.Store
+	authSvc     *auth.Service
 	alertEngine *alerts.Engine
 	collectors  map[string]zfs.Collector
-	apiKey     string
+	cfg         *config.Config
+	apiKey      string
+	version     string
 }
 
-// New creates a new Handler
-func New(s *store.Store, database *db.DB, ae *alerts.Engine, collectors map[string]zfs.Collector, apiKey string) *Handler {
-	return &Handler{
-		store:       s,
-		db:          database,
-		alertEngine: ae,
-		collectors:  collectors,
-		apiKey:      apiKey,
+// RegisterRoutes mounts all ZFSdash routes onto r.
+// This is the canonical entry point called from main.go.
+func RegisterRoutes(r chi.Router, store *db.Store, authSvc *auth.Service, cfg *config.Config, staticFS fs.FS) {
+	h := &Handler{
+		db:      store,
+		authSvc: authSvc,
+		cfg:     cfg,
+		version: "dev",
 	}
-}
 
-// Router returns the chi router
-func (h *Handler) Router() http.Handler {
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	// CORS — credentials required so the session cookie is forwarded.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-API-Key"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: false,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Content-Type", "X-Requested-With"},
+		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 
-	r.Get("/api/health", h.handleHealth)
-	r.Get("/api/hosts", h.handleListHosts)
+	// Setup wizard middleware: redirect any non-setup request to /setup when
+	// no admin account has been created yet.
+	r.Use(h.setupGuard)
 
-	r.Route("/api/hosts/{host}", func(r chi.Router) {
-		r.Get("/pools", h.handleListPools)
-		r.Get("/pools/{pool}/datasets", h.handleListDatasets)
-		r.Get("/pools/{pool}/snapshots", h.handleListSnapshots)
-		r.Post("/pools/{pool}/snapshots", h.handleCreateSnapshot)
-		r.Delete("/pools/{pool}/snapshots/{snapshot}", h.handleDeleteSnapshot)
-		r.Post("/pools/{pool}/scrub", h.handleStartScrub)
-		r.Get("/pools/{pool}/history", h.handlePoolHistory)
-		r.Get("/pools/{pool}/scrub-history", h.handleScrubHistory)
-		r.Get("/smart", h.handleSMARTData)
+	// --- Public routes (no auth required) ---
+
+	// Setup endpoints — always accessible.
+	r.Route("/api/setup", func(r chi.Router) {
+		r.Get("/state", h.handleSetupState)
+		r.Post("/init", h.handleSetupInit)
 	})
 
-	return r
+	// Auth endpoints — always accessible.
+	r.Route("/api/auth", func(r chi.Router) {
+		r.Post("/login", h.handleLogin)
+		r.Post("/logout", h.handleLogout)
+		r.Get("/me", h.handleMe) // MUST return 200 with {user:null}, never 401
+	})
+
+	// Static assets (SPA).
+	if staticFS != nil {
+		r.Handle("/setup", http.FileServer(http.FS(staticFS)))
+		r.Handle("/setup/*", http.FileServer(http.FS(staticFS)))
+		r.Handle("/*", http.FileServer(http.FS(staticFS)))
+	}
+
+	// --- Protected API routes (session required) ---
+	r.Group(func(r chi.Router) {
+		r.Use(h.requireAuth)
+
+		r.Get("/api/health", h.handleHealth)
+		r.Get("/api/hosts", h.handleListHosts)
+
+		r.Route("/api/hosts/{host}", func(r chi.Router) {
+			r.Get("/pools", h.handleListPools)
+			r.Get("/pools/{pool}/datasets", h.handleListDatasets)
+			r.Get("/pools/{pool}/snapshots", h.handleListSnapshots)
+			r.Post("/pools/{pool}/snapshots", h.handleCreateSnapshot)
+			r.Delete("/pools/{pool}/snapshots/{snapshot}", h.handleDeleteSnapshot)
+			r.Post("/pools/{pool}/scrub", h.handleStartScrub)
+			r.Get("/pools/{pool}/history", h.handlePoolHistory)
+			r.Get("/pools/{pool}/scrub-history", h.handleScrubHistory)
+			r.Get("/smart", h.handleSMARTData)
+		})
+	})
 }
 
+// --- Middleware ---
+
+// setupGuard redirects unauthenticated setup to /setup if no admin exists.
+// Requests matching /api/setup/*, /api/auth/*, /setup, or /setup/* pass through.
+func (h *Handler) setupGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// Always allow setup, auth, and static setup UI paths.
+		if strings.HasPrefix(path, "/api/setup") ||
+			strings.HasPrefix(path, "/api/auth") ||
+			strings.HasPrefix(path, "/setup") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// If setup is not complete, redirect everything else.
+		var db interface{ DB() interface{ QueryRow(string, ...interface{}) interface{ Scan(...interface{}) error } } }
+		_ = db
+		if h.db != nil && !wizard.IsSetupComplete(h.db.DB()) {
+			// API requests get a JSON error; browser requests get a redirect.
+			if strings.HasPrefix(path, "/api/") {
+				jsonError(w, "setup required", http.StatusServiceUnavailable)
+				return
+			}
+			http.Redirect(w, r, "/setup", http.StatusFound)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireAuth validates the session cookie and injects the user into the
+// request context. Returns 403 (not 401) for missing/invalid sessions to
+// avoid triggering the browser's built-in Basic Auth dialog.
+func (h *Handler) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := sessionToken(r)
+		if token == "" {
+			jsonError(w, "authentication required", http.StatusForbidden)
+			return
+		}
+		user, err := h.authSvc.ValidateSession(token)
+		if err != nil {
+			slog.Warn("session validation error", "err", err)
+			jsonError(w, "authentication required", http.StatusForbidden)
+			return
+		}
+		if user == nil {
+			jsonError(w, "authentication required", http.StatusForbidden)
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyUser, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// --- Setup handlers ---
+
+func (h *Handler) handleSetupState(w http.ResponseWriter, r *http.Request) {
+	var sqlDB interface{ QueryRow(string, ...interface{}) interface{ Scan(...interface{}) error } }
+	_ = sqlDB
+	state := wizard.GetSetupState(h.db.DB(), h.version)
+	jsonOK(w, state)
+}
+
+func (h *Handler) handleSetupInit(w http.ResponseWriter, r *http.Request) {
+	// Only allow if no admin exists yet.
+	ok, err := h.db.IsFirstRun()
+	if err != nil {
+		jsonError(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		jsonError(w, "setup already complete", http.StatusConflict)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		jsonError(w, "username and password are required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Password) < 8 {
+		jsonError(w, "password must be at least 8 characters", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.authSvc.CreateAdminUser(req.Username, req.Email, req.Password); err != nil {
+		slog.Error("create admin user", "err", err)
+		jsonError(w, "failed to create admin user", http.StatusInternalServerError)
+		return
+	}
+
+	// Log the new admin in immediately and return the session token.
+	token, err := h.authSvc.Login(req.Username, req.Password)
+	if err != nil {
+		slog.Error("auto-login after setup init", "err", err)
+		jsonError(w, "account created but login failed", http.StatusInternalServerError)
+		return
+	}
+
+	setSessionCookie(w, token)
+	jsonOK(w, map[string]interface{}{
+		"message": "Setup complete. Welcome to ZFSdash.",
+		"token":   token,
+	})
+}
+
+// --- Auth handlers ---
+
+func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	token, err := h.authSvc.Login(req.Username, req.Password)
+	if err != nil {
+		// Use 403 instead of 401 to avoid browser Basic Auth popup.
+		jsonError(w, "invalid username or password", http.StatusForbidden)
+		return
+	}
+
+	setSessionCookie(w, token)
+	jsonOK(w, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) handleLogout(w http.ResponseWriter, r *http.Request) {
+	token := sessionToken(r)
+	if token != "" {
+		if err := h.authSvc.Logout(token); err != nil {
+			slog.Warn("logout error", "err", err)
+		}
+	}
+	clearSessionCookie(w)
+	jsonOK(w, map[string]string{"status": "ok"})
+}
+
+// handleMe returns the current authenticated user, or {user: null} when not
+// logged in. This endpoint MUST return HTTP 200 in all cases — returning 401
+// would trigger the browser's built-in Basic Auth credential popup.
+func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
+	token := sessionToken(r)
+	if token == "" {
+		jsonOK(w, map[string]interface{}{"user": nil})
+		return
+	}
+	user, err := h.authSvc.ValidateSession(token)
+	if err != nil || user == nil {
+		jsonOK(w, map[string]interface{}{"user": nil})
+		return
+	}
+	jsonOK(w, map[string]interface{}{"user": userResponse(user)})
+}
+
+// --- Existing ZFS handlers (preserved) ---
+
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
-	jsonOK(w, map[string]string{"status": "ok", "version": "0.1.0"})
+	jsonOK(w, map[string]string{"status": "ok", "version": h.version})
 }
 
 func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		jsonOK(w, []interface{}{})
+		return
+	}
 	hosts := h.store.GetAllHosts()
 	type hostSummary struct {
 		Name        string    `json:"name"`
@@ -95,6 +315,10 @@ func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListPools(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonOK(w, []interface{}{})
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	col, ok := h.collectors[hostName]
 	if !ok {
@@ -106,7 +330,6 @@ func (h *Handler) handleListPools(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Enrich with scrub status
 	for _, p := range pools {
 		if scrub, err := col.CollectScrubStatus(r.Context(), p.Name); err == nil {
 			p.Scrub = scrub
@@ -115,19 +338,13 @@ func (h *Handler) handleListPools(w http.ResponseWriter, r *http.Request) {
 			p.VdevTree = vdev
 		}
 	}
-	// Update store and record history
-	hd := &store.HostData{
-		Pools:     pools,
-		Datasets:  make(map[string][]*zfs.Dataset),
-		Snapshots: make(map[string][]*zfs.Snapshot),
-	}
-	h.store.SetHostData(hostName, hd)
-	if h.db != nil {
-		for _, p := range pools {
-			if err := h.db.RecordPoolSnapshot(hostName, p); err != nil {
-				log.Printf("[db] record pool snapshot: %v", err)
-			}
+	if h.store != nil {
+		hd := &store.HostData{
+			Pools:     pools,
+			Datasets:  make(map[string][]*zfs.Dataset),
+			Snapshots: make(map[string][]*zfs.Snapshot),
 		}
+		h.store.SetHostData(hostName, hd)
 	}
 	if h.alertEngine != nil {
 		h.alertEngine.CheckPools(hostName, pools)
@@ -136,6 +353,10 @@ func (h *Handler) handleListPools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListDatasets(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonOK(w, []interface{}{})
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	poolName := chi.URLParam(r, "pool")
 	col, ok := h.collectors[hostName]
@@ -152,6 +373,10 @@ func (h *Handler) handleListDatasets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonOK(w, []interface{}{})
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	poolName := chi.URLParam(r, "pool")
 	col, ok := h.collectors[hostName]
@@ -168,6 +393,10 @@ func (h *Handler) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonError(w, "no collectors configured", http.StatusServiceUnavailable)
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	poolName := chi.URLParam(r, "pool")
 	col, ok := h.collectors[hostName]
@@ -197,6 +426,10 @@ func (h *Handler) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonError(w, "no collectors configured", http.StatusServiceUnavailable)
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	snapshotName := chi.URLParam(r, "snapshot")
 	col, ok := h.collectors[hostName]
@@ -212,6 +445,10 @@ func (h *Handler) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleStartScrub(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonError(w, "no collectors configured", http.StatusServiceUnavailable)
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	poolName := chi.URLParam(r, "pool")
 	col, ok := h.collectors[hostName]
@@ -233,10 +470,13 @@ func (h *Handler) handlePoolHistory(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, []interface{}{})
 		return
 	}
-	history, err := h.db.GetPoolHistory(hostName, poolName, 168) // 7 days at 1hr intervals
+	history, err := h.db.GetPoolHistory(hostName, poolName, 168)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if history == nil {
+		history = []db.PoolSnapshot{}
 	}
 	jsonOK(w, history)
 }
@@ -253,10 +493,17 @@ func (h *Handler) handleScrubHistory(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if history == nil {
+		history = []db.ScrubRecord{}
+	}
 	jsonOK(w, history)
 }
 
 func (h *Handler) handleSMARTData(w http.ResponseWriter, r *http.Request) {
+	if h.collectors == nil {
+		jsonOK(w, []interface{}{})
+		return
+	}
 	hostName := chi.URLParam(r, "host")
 	col, ok := h.collectors[hostName]
 	if !ok {
@@ -271,16 +518,70 @@ func (h *Handler) handleSMARTData(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, smartData)
 }
 
-// --- helpers ---
+// --- Cookie helpers ---
+
+func sessionToken(r *http.Request) string {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cookie.Value)
+}
+
+func setSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionDuration.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		// Secure: true — enable when TLS is in front.
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// --- Response helpers ---
+
+// userResponse converts a db.User to a safe JSON-serialisable map (no password hash).
+func userResponse(u *db.User) map[string]interface{} {
+	if u == nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"id":         u.ID,
+		"username":   u.Username,
+		"email":      u.Email,
+		"is_admin":   u.IsAdmin,
+		"created_at": u.CreatedAt,
+	}
+}
 
 func jsonOK(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("[web] json encode: %v", err)
+	}
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+		log.Printf("[web] json encode error: %v", err)
+	}
 }
+
+// Suppress unused import warnings for packages pulled in transitively.
+var _ = middleware.Logger
