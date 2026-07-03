@@ -1,22 +1,16 @@
 [Unit]
 Description=ZFSdash — ZFS Management Dashboard
-Documentation=https://zfsdash.com
 After=network.target
 
 [Service]
 Type=simple
-User=zfsdash
-Group=zfsdash
-ExecStart=/usr/local/bin/zfsdash -config /etc/zfsdash/config.yaml
-Restart=always
-RestartSec=10
+User=root
+ExecStart=/usr/local/bin/zfsdash
+Restart=on-failure
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=zfsdash
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/zfsdash
-ReadOnlyPaths=/etc/zfsdash
 
 [Install]
 WantedBy=multi-user.target

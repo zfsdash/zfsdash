@@ -1,0 +1,16 @@
+#!/bin/sh
+# PROVIDE: zfsdash
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="zfsdash"
+rcvar="zfsdash_enable"
+command="/usr/local/bin/zfsdash"
+pidfile="/var/run/${name}.pid"
+
+load_rc_config $name
+: ${zfsdash_enable:="NO"}
+
+run_rc_command "$1"
