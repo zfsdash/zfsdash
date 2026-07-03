@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -20,167 +21,159 @@ import (
 	"github.com/zfsdash/zfsdash/internal/zfs"
 )
 
+//go:embed internal/web/static
+var staticFiles embed.FS
+
 func main() {
-	configPath := flag.String("config", "config.yaml", "path to config file")
+	configPath := flag.String("config", "", "Path to config file (optional)")
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-
-	database, err := db.Open(cfg.DB.Path)
-	if err != nil {
-		log.Fatalf("open db: %v", err)
-	}
-	defer database.Close()
-
-	st := store.New()
-	alertMgr := alerts.New(cfg.Alerts)
-	collectors := make(web.CollectorMap)
-
-	// Build a collector for each configured host
-	for _, hostCfg := range cfg.Hosts {
-		col, err := buildCollector(hostCfg)
+	var cfg *config.Config
+	var err error
+	if *configPath != "" {
+		cfg, err = config.Load(*configPath)
 		if err != nil {
-			log.Printf("[main] host %s: build collector: %v — skipping", hostCfg.Name, err)
+			log.Fatalf("Failed to load config: %v", err)
+		}
+	} else {
+		cfg = config.DefaultConfig()
+	}
+
+	// Open database
+	var database *db.DB
+	if err := os.MkdirAll("/var/lib/zfsdash", 0755); err == nil {
+		database, err = db.Open(cfg.DB.Path)
+		if err != nil {
+			log.Printf("Warning: could not open database: %v (history disabled)", err)
+			database = nil
+		}
+	} else {
+		log.Printf("Warning: could not create data dir: %v (history disabled)", err)
+	}
+
+	// Build collectors
+	collectors := make(map[string]zfs.Collector)
+	for _, hcfg := range cfg.Hosts {
+		col, err := newCollector(hcfg)
+		if err != nil {
+			log.Printf("Warning: failed to create collector for host %s: %v", hcfg.Hostname, err)
 			continue
 		}
-		collectors[hostCfg.Name] = col
-		st.SetError(hostCfg.Name, "initializing...")
+		collectors[hcfg.Hostname] = col
+		log.Printf("Registered host: %s (mode: %s)", hcfg.Hostname, hcfg.Mode)
 	}
 
-	// Start background collection goroutine for each host
-	for name, col := range collectors {
-		go collectLoop(name, col, st, database, alertMgr)
-	}
+	// Store and alert engine
+	s := store.New()
+	ae := alerts.New(&cfg.Alerts)
 
-	// Build HTTP handler
-	apiHandler := web.New(st, database, collectors)
-
-	mux := http.NewServeMux()
-	mux.Handle("/api/", apiHandler)
-
-	// Try to serve embedded static files
-	staticFS, err := fs.Sub(web.Static, "static")
-	if err == nil {
-		mux.Handle("/", http.FileServer(http.FS(staticFS)))
-	} else {
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, `<!DOCTYPE html><html><head><title>ZFSdash</title></head>`+
-				`<body style="background:#0f172a;color:#e2e8f0;font-family:monospace;padding:2rem">`+
-				`<h1>ZFS<span style="color:#60a5fa">dash</span></h1>`+
-				`<p>API is running. Build the frontend: <code>cd web && npm run build</code></p>`+
-				`<p><a href="/api/health" style="color:#60a5fa">/api/health</a> · `+
-				`<a href="/api/hosts" style="color:#60a5fa">/api/hosts</a></p>`+
-				`</body></html>`)
+	// Pre-populate store with known hosts
+	for name := range collectors {
+		s.SetHostData(name, &store.HostData{
+			Datasets:  make(map[string][]*zfs.Dataset),
+			Snapshots: make(map[string][]*zfs.Snapshot),
 		})
 	}
 
+	// HTTP handler
+	h := web.New(s, database, ae, collectors, cfg.Server.APIKey)
+	r := h.Router()
+
+	// Serve embedded static files at root
+	staticFS, err := fs.Sub(staticFiles, "internal/web/static")
+	if err != nil {
+		log.Fatalf("Failed to create static FS: %v", err)
+	}
+	fileServer := http.FileServer(http.FS(staticFS))
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/", r)
+	mux.Handle("/", fileServer)
+
 	srv := &http.Server{
-		Addr:         cfg.Server.Addr,
+		Addr:         cfg.Server.Listen,
 		Handler:      mux,
-		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * time.Second,
-		WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
+	// Background collection loop
 	go func() {
-		log.Printf("[main] ZFSdash listening on %s", cfg.Server.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		// Run immediately on start
+		collectAll(collectors, s, database, ae)
+		for range ticker.C {
+			collectAll(collectors, s, database, ae)
 		}
 	}()
 
+	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	log.Printf("ZFSdash listening on %s", cfg.Server.Listen)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
 	<-quit
-	log.Println("[main] shutting down...")
+	log.Println("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Shutdown error: %v", err)
+	}
 	for _, col := range collectors {
-		_ = col.Close()
+		col.Close()
 	}
-	log.Println("[main] goodbye")
+	if database != nil {
+		database.Close()
+	}
+	log.Println("ZFSdash stopped.")
 }
 
-func buildCollector(h config.HostConfig) (zfs.Collector, error) {
-	switch h.Mode {
+func newCollector(cfg zfs.CollectorConfig) (zfs.Collector, error) {
+	switch cfg.Mode {
 	case "local", "":
-		return zfs.NewLocalCollector(), nil
+		return zfs.NewLocalCollector(cfg.Timeout), nil
 	case "ssh":
-		pem := h.SSH.PrivateKeyPEM
-		if pem == "" && h.SSH.PrivateKeyPath != "" {
-			data, err := os.ReadFile(h.SSH.PrivateKeyPath)
-			if err != nil {
-				return nil, fmt.Errorf("read key %s: %w", h.SSH.PrivateKeyPath, err)
-			}
-			pem = string(data)
-		}
-		return zfs.NewSSHCollector(zfs.SSHConfig{
-			Host:          h.SSH.Host,
-			Port:          h.SSH.Port,
-			User:          h.SSH.User,
-			Password:      h.SSH.Password,
-			PrivateKeyPEM: pem,
-		})
+		return zfs.NewSSHCollector(cfg)
 	case "truenas":
-		return zfs.NewTrueNASCollector(zfs.TrueNASConfig{
-			URL:      h.TrueNAS.URL,
-			APIKey:   h.TrueNAS.APIKey,
-			Username: h.TrueNAS.Username,
-			Password: h.TrueNAS.Password,
-			Insecure: h.TrueNAS.Insecure,
-		})
+		return zfs.NewTrueNASCollector(cfg), nil
 	default:
-		return nil, fmt.Errorf("unknown mode %q", h.Mode)
+		return nil, fmt.Errorf("unknown mode: %s", cfg.Mode)
 	}
 }
 
-func collectLoop(host string, col zfs.Collector, st *store.Store, database *db.DB, alertMgr *alerts.Manager) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	collect(host, col, st, database, alertMgr)
-	for range ticker.C {
-		collect(host, col, st, database, alertMgr)
-	}
-}
-
-func collect(host string, col zfs.Collector, st *store.Store, database *db.DB, alertMgr *alerts.Manager) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-
-	pools, err := col.GetPools(ctx)
-	if err != nil {
-		log.Printf("[collector][%s] GetPools: %v", host, err)
-		st.SetError(host, err.Error())
-	} else {
-		st.SetPools(host, pools)
-		for _, p := range pools {
-			_ = database.RecordPoolHistory(host, p.Name, p.Capacity, p.Allocated, p.Size, p.State)
+func collectAll(collectors map[string]zfs.Collector, s *store.Store, database *db.DB, ae *alerts.Engine) {
+	for name, col := range collectors {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		pools, err := col.CollectPools(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("[collect] %s: %v", name, err)
+			s.SetHostError(name, err.Error())
+			continue
 		}
-		alertMgr.CheckPools(host, pools)
-	}
-
-	ds, err := col.GetDatasets(ctx, "")
-	if err != nil {
-		log.Printf("[collector][%s] GetDatasets: %v", host, err)
-	} else {
-		st.SetDatasets(host, ds)
-	}
-
-	snaps, err := col.GetSnapshots(ctx, "")
-	if err != nil {
-		log.Printf("[collector][%s] GetSnapshots: %v", host, err)
-	} else {
-		st.SetSnapshots(host, snaps)
-	}
-
-	smart, err := col.GetSMARTData(ctx)
-	if err != nil {
-		log.Printf("[collector][%s] GetSMARTData: %v", host, err)
-	} else if smart != nil {
-		st.SetSMARTData(host, smart)
-		alertMgr.CheckSMART(host, smart)
+		hd := &store.HostData{
+			Pools:     pools,
+			Datasets:  make(map[string][]*zfs.Dataset),
+			Snapshots: make(map[string][]*zfs.Snapshot),
+		}
+		s.SetHostData(name, hd)
+		if database != nil {
+			for _, p := range pools {
+				if err := database.RecordPoolSnapshot(name, p); err != nil {
+					log.Printf("[db] %v", err)
+				}
+			}
+		}
+		if ae != nil {
+			ae.CheckPools(name, pools)
+		}
 	}
 }
