@@ -1,114 +1,129 @@
 package zfs
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
-// Pool represents a ZFS pool.
+// Pool represents a ZFS storage pool
 type Pool struct {
-	Name        string       `json:"name"`
-	State       string       `json:"state"` // ONLINE, DEGRADED, FAULTED, OFFLINE, REMOVED, UNAVAIL
-	Health      string       `json:"health"`
-	Size        uint64       `json:"size"`
-	Allocated   uint64       `json:"allocated"`
-	Free        uint64       `json:"free"`
-	Capacity    float64      `json:"capacity"` // 0-100
-	ReadOps     uint64       `json:"read_ops"`
-	WriteOps    uint64       `json:"write_ops"`
-	ReadBytes   uint64       `json:"read_bytes"`
-	WriteBytes  uint64       `json:"write_bytes"`
-	Errors      uint64       `json:"errors"`
-	ScrubStatus *ScrubStatus `json:"scrub_status,omitempty"`
-	ScanStatus  *ScrubStatus `json:"scan_status,omitempty"`
-	Vdevs       []Vdev       `json:"vdevs,omitempty"`
-	UpdatedAt   time.Time    `json:"updated_at"`
+	Name      string    `json:"name"`
+	Health    string    `json:"health"`
+	Size      int64     `json:"size"`
+	Allocated int64     `json:"allocated"`
+	Free      int64     `json:"free"`
+	Capacity  int       `json:"capacity"` // percentage 0-100
+	Datasets  int       `json:"datasets"`
+	Snapshots int       `json:"snapshots"`
+	Scrub     *Scrub    `json:"scrub,omitempty"`
+	VdevTree  *Vdev     `json:"vdev_tree,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
-// Vdev is a virtual device in a pool.
-type Vdev struct {
-	Name     string `json:"name"`
-	State    string `json:"state"`
-	Read     uint64 `json:"read"`
-	Write    uint64 `json:"write"`
-	Cksum    uint64 `json:"cksum"`
-	Children []Vdev `json:"children,omitempty"`
-}
-
-// Dataset is a ZFS dataset, volume, or snapshot.
+// Dataset represents a ZFS filesystem or volume
 type Dataset struct {
-	Name          string    `json:"name"`
-	Pool          string    `json:"pool"`
-	Type          string    `json:"type"`
-	Used          uint64    `json:"used"`
-	Available     uint64    `json:"available"`
-	Referenced    uint64    `json:"referenced"`
-	LogicalUsed   uint64    `json:"logical_used"`
-	Mounted       bool      `json:"mounted"`
-	MountPoint    string    `json:"mount_point"`
-	Compression   string    `json:"compression"`
-	CompressRatio float64   `json:"compress_ratio"`
-	Dedup         bool      `json:"dedup"`
-	Quota         uint64    `json:"quota"`
-	Reservation   uint64    `json:"reservation"`
-	VolSize       *uint64   `json:"vol_size,omitempty"`
-	Encryption    string    `json:"encryption"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Name       string    `json:"name"`
+	Used       int64     `json:"used"`
+	Available  int64     `json:"available"`
+	Referenced int64     `json:"referenced"`
+	Mountpoint string    `json:"mountpoint"`
+	Type       string    `json:"type"` // filesystem, volume, snapshot
+	Timestamp  time.Time `json:"timestamp"`
 }
 
-// Snapshot is a ZFS snapshot.
+// Snapshot represents a ZFS snapshot
 type Snapshot struct {
 	Name       string    `json:"name"`
-	Dataset    string    `json:"dataset"`
 	Pool       string    `json:"pool"`
-	Used       uint64    `json:"used"`
-	Referenced uint64    `json:"referenced"`
+	Dataset    string    `json:"dataset"`
+	Used       int64     `json:"used"`
+	Referenced int64     `json:"referenced"`
 	CreatedAt  time.Time `json:"created_at"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
-// SMARTData holds SMART health attributes for a physical drive.
+// Scrub represents ZFS pool scrub status
+type Scrub struct {
+	State       string    `json:"state"` // none, scanning, paused, finished
+	StartTime   time.Time `json:"start_time,omitempty"`
+	EndTime     time.Time `json:"end_time,omitempty"`
+	Progress    int       `json:"progress"` // percentage 0-100
+	Rate        string    `json:"rate"`
+	Errors      int       `json:"errors"`
+	DurationSec int64     `json:"duration_sec"`
+}
+
+// Vdev represents a ZFS virtual device in a pool
+type Vdev struct {
+	Name     string  `json:"name"`
+	Type     string  `json:"type"` // disk, mirror, raidz1, raidz2, raidz3
+	State    string  `json:"state"`
+	Read     int64   `json:"read_errors"`
+	Write    int64   `json:"write_errors"`
+	Checksum int64   `json:"checksum_errors"`
+	Children []*Vdev `json:"children,omitempty"`
+}
+
+// SMARTData represents S.M.A.R.T. data for a disk
 type SMARTData struct {
-	Device              string    `json:"device"`
-	Model               string    `json:"model"`
-	Serial              string    `json:"serial"`
-	Health              string    `json:"health"`
-	Temperature         int       `json:"temperature"`
-	PowerOnHours        uint64    `json:"power_on_hours"`
-	PowerCycles         uint64    `json:"power_cycles"`
-	ReallocatedSectors  uint64    `json:"reallocated_sectors"`
-	PendingSectors      uint64    `json:"pending_sectors"`
-	UncorrectableErrors uint64    `json:"uncorrectable_errors"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	Device             string    `json:"device"`
+	ModelName          string    `json:"model_name"`
+	SerialNumber       string    `json:"serial_number"`
+	Temperature        int       `json:"temperature"`
+	PowerOnHours       int       `json:"power_on_hours"`
+	ReallocatedSectors int       `json:"reallocated_sectors"`
+	PendingSectors     int       `json:"pending_sectors"`
+	HealthStatus       string    `json:"health_status"` // passed, failed, unknown
+	Timestamp          time.Time `json:"timestamp"`
 }
 
-// ScrubStatus is the current scrub state of a pool.
-type ScrubStatus struct {
-	State         string     `json:"state"`
-	Function      string     `json:"function"`
-	StartTime     *time.Time `json:"start_time,omitempty"`
-	EndTime       *time.Time `json:"end_time,omitempty"`
-	Progress      float64    `json:"progress"`
-	Examined      uint64     `json:"examined"`
-	Total         uint64     `json:"total"`
-	Errors        uint64     `json:"errors"`
-	Duration      uint64     `json:"duration"`
-	RemainingTime uint64     `json:"remaining_time"`
+// PoolSnapshot records pool state at a point in time for history
+type PoolSnapshot struct {
+	ID        int64     `json:"id"`
+	PoolName  string    `json:"pool_name"`
+	Size      int64     `json:"size"`
+	Allocated int64     `json:"allocated"`
+	Free      int64     `json:"free"`
+	Capacity  int       `json:"capacity"`
+	Health    string    `json:"health"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// ZFSData is the complete collected snapshot for one host.
-type ZFSData struct {
-	Pools       []Pool       `json:"pools"`
-	Datasets    []*Dataset   `json:"datasets"`
-	Snapshots   []*Snapshot  `json:"snapshots"`
-	SMART       []*SMARTData `json:"smart,omitempty"`
-	CollectedAt time.Time    `json:"collected_at"`
+// ScrubHistory records historical scrub information
+type ScrubHistory struct {
+	ID        int64     `json:"id"`
+	PoolName  string    `json:"pool_name"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	Duration  int64     `json:"duration_sec"`
+	Errors    int       `json:"errors"`
+	State     string    `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// Alert is a triggered monitoring alert.
-type Alert struct {
-	ID        string    `json:"id"`
-	HostName  string    `json:"host_name"`
-	PoolName  string    `json:"pool_name,omitempty"`
-	Device    string    `json:"device,omitempty"`
-	Severity  string    `json:"severity"`
-	Type      string    `json:"type"`
-	Message   string    `json:"message"`
-	Triggered time.Time `json:"triggered"`
+// CollectorConfig holds configuration for a host
+type CollectorConfig struct {
+	Mode     string `yaml:"mode"` // local, ssh, truenas
+	Hostname string `yaml:"hostname"`
+	Host     string `yaml:"host,omitempty"`
+	Port     int    `yaml:"port,omitempty"`
+	Username string `yaml:"username,omitempty"`
+	Password string `yaml:"password,omitempty"`
+	APIKey   string `yaml:"api_key,omitempty"`
+	SSHKey   string `yaml:"ssh_key,omitempty"`
+	Timeout  int    `yaml:"timeout,omitempty"`
+}
+
+// Collector interface defines ZFS data collection
+type Collector interface {
+	CollectPools(ctx context.Context) ([]*Pool, error)
+	CollectDatasets(ctx context.Context, poolName string) ([]*Dataset, error)
+	CollectSnapshots(ctx context.Context, datasetName string) ([]*Snapshot, error)
+	CollectScrubStatus(ctx context.Context, poolName string) (*Scrub, error)
+	CollectVdevTree(ctx context.Context, poolName string) (*Vdev, error)
+	CollectSMARTData(ctx context.Context) (map[string]*SMARTData, error)
+	CreateSnapshot(ctx context.Context, datasetName, snapshotName string) error
+	DestroySnapshot(ctx context.Context, snapshotName string) error
+	StartScrub(ctx context.Context, poolName string) error
+	Close() error
 }
