@@ -1,0 +1,61 @@
+# ZFSdash configuration
+# Copy to config.yaml and adjust for your environment.
+
+server:
+  addr: ":8080"
+  read_timeout: 30
+  write_timeout: 30
+
+db:
+  path: "zfsdash.db"
+
+# Define one or more hosts to monitor.
+# mode: local | ssh | truenas
+hosts:
+  # Local mode: monitors ZFS on the machine running ZFSdash.
+  # Best for running directly on your ZFS host.
+  - name: "localhost"
+    mode: "local"
+
+  # SSH mode: connects to a remote host over SSH.
+  # Requires zpool/zfs commands available on the remote.
+  # - name: "nas-1"
+  #   mode: "ssh"
+  #   ssh:
+  #     host: "192.168.1.10"
+  #     port: 22
+  #     user: "root"
+  #     private_key_path: "/home/you/.ssh/id_ed25519"
+  #     # Or inline PEM:
+  #     # private_key_pem: |
+  #     #   -----BEGIN OPENSSH PRIVATE KEY-----
+  #     #   ...
+  #     #   -----END OPENSSH PRIVATE KEY-----
+
+  # TrueNAS mode: uses the TrueNAS Scale/Core REST API.
+  # - name: "truenas-main"
+  #   mode: "truenas"
+  #   truenas:
+  #     url: "https://192.168.1.20"
+  #     api_key: "1-xxxxxxxxxxxxxxxxxxxx"
+  #     insecure: true  # set true if using self-signed cert
+
+alerts:
+  enabled: false
+  cooldown_minutes: 60
+  capacity_warn_pct: 80
+  capacity_crit_pct: 90
+
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    from: "zfsdash@example.com"
+    to: "admin@example.com"
+    username: "zfsdash@example.com"
+    password: "your-app-password"
+
+  webhook:
+    enabled: false
+    url: "https://hooks.slack.com/services/xxx/yyy/zzz"
+    # secret: "optional-hmac-secret"
