@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type Host } from '@/lib/api';
 import { DashboardHeader } from '@/components/dashboard/Header';
@@ -16,19 +16,22 @@ export default function DashboardPage() {
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Fetch hosts
-  const { data: hosts = [], isLoading: hostsLoading } = useQuery({
+  const { data: hosts, isLoading: hostsLoading } = useQuery<Host[]>({
     queryKey: ['hosts'],
     queryFn: api.listHosts,
-    onSuccess: (data: Host[]) => {
-      if (!selectedHost && data.length > 0 && data[0]) {
-        setSelectedHost(data[0]);
-      }
-    },
-  } as Parameters<typeof useQuery>[0]);
+    refetchInterval: 60_000,
+  });
+
+  // Auto-select the first host
+  useEffect(() => {
+    if (!selectedHost && hosts && hosts.length > 0 && hosts[0]) {
+      setSelectedHost(hosts[0]);
+    }
+  }, [hosts, selectedHost]);
 
   // Fetch pools for selected host
   const {
-    data: pools = [],
+    data: pools,
     isLoading: poolsLoading,
     error: poolsError,
   } = useQuery({
@@ -56,11 +59,14 @@ export default function DashboardPage() {
     );
   }
 
+  const hostList: Host[] = hosts ?? [];
+  const poolList = pools ?? [];
+
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col">
       <DashboardHeader
         selectedHost={selectedHost}
-        hosts={hosts}
+        hosts={hostList}
         onSelectHost={setSelectedHost}
         onRefresh={refresh}
         isRefreshing={isRefreshing}
@@ -68,12 +74,12 @@ export default function DashboardPage() {
 
       <main className="flex-1 px-4 sm:px-6 py-6 max-w-screen-xl mx-auto w-full">
         {/* No hosts */}
-        {hosts.length === 0 && <EmptyState type="no-hosts" />}
+        {hostList.length === 0 && <EmptyState type="no-hosts" />}
 
         {selectedHost && (
           <div className="flex flex-col gap-6">
             {/* Quick Stats */}
-            {pools.length > 0 && <QuickStats pools={pools} />}
+            {poolList.length > 0 && <QuickStats pools={poolList} />}
 
             {/* Pool Grid */}
             <section>
@@ -81,7 +87,7 @@ export default function DashboardPage() {
                 <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-2">
                   <Database className="w-4 h-4" />
                   Pools
-                  {pools.length > 0 && (
+                  {poolList.length > 0 && (
                     <span className="ml-1 text-gray-600 font-normal normal-case tracking-normal">
                       — {selectedHost.name}
                     </span>
@@ -92,7 +98,7 @@ export default function DashboardPage() {
                 )}
               </div>
 
-              {poolsError ? (
+              {poolsError != null ? (
                 <div className="bg-red-500/10 border border-red-500/30 rounded-xl px-5 py-4 text-red-400 text-sm">
                   Failed to load pools: {(poolsError as Error).message}
                 </div>
@@ -102,11 +108,11 @@ export default function DashboardPage() {
                     <div key={i} className="bg-gray-900 border border-gray-800 rounded-xl h-64 animate-pulse" />
                   ))}
                 </div>
-              ) : pools.length === 0 ? (
+              ) : poolList.length === 0 ? (
                 <EmptyState type="no-pools" hostId={selectedHost.id} />
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                  {pools.map((pool) => (
+                  {poolList.map((pool) => (
                     <PoolCard key={pool.name} pool={pool} hostId={selectedHost.id} />
                   ))}
                 </div>
@@ -114,9 +120,7 @@ export default function DashboardPage() {
             </section>
 
             {/* Events feed */}
-            {selectedHost && (
-              <EventFeed hostId={selectedHost.id} />
-            )}
+            <EventFeed hostId={selectedHost.id} />
           </div>
         )}
       </main>
