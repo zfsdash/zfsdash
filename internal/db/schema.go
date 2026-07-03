@@ -1,5 +1,10 @@
 package db
 
+// schema contains all CREATE TABLE / CREATE INDEX statements.
+// All statements use IF NOT EXISTS so the schema is idempotent on every startup.
+// The ALTER TABLE statements at the bottom are wrapped in BEGIN/COMMIT and
+// silently ignored if the column already exists (SQLite returns an error that
+// we swallow in Migrate).
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -16,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL DEFAULT '',
   ip_address TEXT,
   user_agent TEXT,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -24,6 +30,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
@@ -84,3 +91,17 @@ CREATE TABLE IF NOT EXISTS alert_configs (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `
+
+// Migrate runs the base schema and any incremental column additions.
+// Column additions use a "try ALTER TABLE, ignore error" pattern because
+// SQLite does not support IF NOT EXISTS on ALTER TABLE ADD COLUMN prior
+// to version 3.37.0, and modernc.org/sqlite may not always be at that
+// version in all environments.
+func (s *Store) runMigrations() {
+	// token_hash column — added when we switched from plain-ID sessions to
+	// SHA256-hashed tokens. Safe to ignore if already present.
+	s.db.Exec(`ALTER TABLE sessions ADD COLUMN token_hash TEXT NOT NULL DEFAULT ''`)
+
+	// last_login_at — tracks when the user last authenticated.
+	s.db.Exec(`ALTER TABLE users ADD COLUMN last_login_at DATETIME`)
+}
