@@ -9,8 +9,8 @@ import (
 )
 
 // LocalCollectFn builds a telemetry collect function backed by a
-// zfs.LocalCollector. This is the bridge between the agent and the
-// existing ZFS collection layer.
+// zfs.LocalCollector. This bridges the agent and the existing ZFS
+// collection layer without an import cycle.
 func LocalCollectFn(lc *zfs.LocalCollector) func(ctx context.Context) (*TelemetryPayload, error) {
 	return func(ctx context.Context) (*TelemetryPayload, error) {
 		payload := &TelemetryPayload{
@@ -21,7 +21,7 @@ func LocalCollectFn(lc *zfs.LocalCollector) func(ctx context.Context) (*Telemetr
 		pools, err := lc.CollectPools(ctx)
 		if err != nil {
 			slog.Warn("agent: collect pools", "err", err)
-			// Return empty payload rather than error — let the loop keep going.
+			// Return empty payload; let the loop keep going.
 			return payload, nil
 		}
 
@@ -43,7 +43,7 @@ func LocalCollectFn(lc *zfs.LocalCollector) func(ctx context.Context) (*Telemetr
 				}
 			}
 
-			// Datasets.
+			// Datasets for this pool.
 			datasets, err := lc.CollectDatasets(ctx, p.Name)
 			if err != nil {
 				slog.Warn("agent: collect datasets", "pool", p.Name, "err", err)
