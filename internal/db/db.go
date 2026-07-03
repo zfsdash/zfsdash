@@ -31,12 +31,6 @@ func (s *Store) Close() error { return s.db.Close() }
 // DB returns the underlying *sql.DB (used by wizard and other sub-packages).
 func (s *Store) DB() *sql.DB { return s.db }
 
-// Migrate runs all schema migrations.
-func (s *Store) Migrate() error {
-	_, err := s.db.Exec(schema)
-	return err
-}
-
 // IsFirstRun returns true if no users exist yet.
 func (s *Store) IsFirstRun() (bool, error) {
 	var count int
@@ -142,7 +136,7 @@ type Session struct {
 }
 
 // CreateSessionByHash inserts a new session using the pre-hashed token.
-// The caller is responsible for passing hashToken(plaintextToken) as tokenHash.
+// The caller must pass hashToken(plaintextToken) as tokenHash.
 func (s *Store) CreateSessionByHash(id, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := s.db.Exec(
 		`INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
@@ -167,7 +161,7 @@ func (s *Store) GetSessionByHash(tokenHash string) (*Session, error) {
 	return sess, err
 }
 
-// DeleteSessionByHash removes a session by token hash (used for logout).
+// DeleteSessionByHash removes a session by token hash (logout).
 func (s *Store) DeleteSessionByHash(tokenHash string) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
 	return err
@@ -182,40 +176,7 @@ func (s *Store) TouchSessionActivity(sessionID string) error {
 	return err
 }
 
-// --- Legacy session operations (kept for backwards compat during transition) ---
-
-// CreateSession is the legacy plain-ID session creator. New code should use
-// CreateSessionByHash instead.
-func (s *Store) CreateSession(id, userID string, expiresAt time.Time) error {
-	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-		id, userID, id, expiresAt, // token_hash == id for legacy rows
-	)
-	return err
-}
-
-// GetSession is the legacy session lookup by plain ID.
-func (s *Store) GetSession(id string) (*Session, error) {
-	sess := &Session{}
-	err := s.db.QueryRow(
-		`SELECT id, user_id, token_hash, expires_at, created_at, last_activity_at
-		 FROM sessions
-		 WHERE id = ? AND expires_at > datetime('now')`,
-		id,
-	).Scan(&sess.ID, &sess.UserID, &sess.TokenHash, &sess.ExpiresAt, &sess.CreatedAt, &sess.LastActivityAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return sess, err
-}
-
-// DeleteSession is the legacy session delete by plain ID.
-func (s *Store) DeleteSession(id string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
-	return err
-}
-
-// DeleteExpiredSessions purges all expired sessions (for periodic cleanup).
+// DeleteExpiredSessions purges all expired sessions.
 func (s *Store) DeleteExpiredSessions() error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= datetime('now')`)
 	return err
@@ -286,7 +247,7 @@ func (s *Store) DeleteHost(id string) error {
 	return err
 }
 
-// --- Pool history / scrub history (used by existing handler) ---
+// --- Pool history ---
 
 // PoolSnapshot is a point-in-time pool metric record.
 type PoolSnapshot struct {
@@ -299,15 +260,7 @@ type PoolSnapshot struct {
 	RecordedAt time.Time `json:"recorded_at"`
 }
 
-// RecordPoolSnapshot inserts a pool metrics snapshot. hostID may be the host
-// name string when a UUID lookup is unavailable (existing handler behaviour).
-func (s *Store) RecordPoolSnapshot(hostID string, p interface{ GetName() string }) error {
-	// This is a no-op stub kept for API compatibility with the existing handler.
-	// The concrete implementation lives in internal/db (pool_history table).
-	return nil
-}
-
-// GetPoolHistory returns up to limit recent pool snapshots for a named pool.
+// GetPoolHistory returns up to limit recent pool snapshots.
 func (s *Store) GetPoolHistory(hostID, poolName string, limit int) ([]PoolSnapshot, error) {
 	rows, err := s.db.Query(
 		`SELECT host_id, pool_name, size_bytes, alloc_bytes, free_bytes, health, recorded_at
@@ -332,6 +285,8 @@ func (s *Store) GetPoolHistory(hostID, poolName string, limit int) ([]PoolSnapsh
 	return out, rows.Err()
 }
 
+// --- Scrub history ---
+
 // ScrubRecord is a single scrub history entry.
 type ScrubRecord struct {
 	HostID    string     `json:"host_id"`
@@ -342,7 +297,7 @@ type ScrubRecord struct {
 	EndedAt   *time.Time `json:"ended_at"`
 }
 
-// GetScrubHistory returns up to limit recent scrub records for a named pool.
+// GetScrubHistory returns up to limit recent scrub records.
 func (s *Store) GetScrubHistory(hostID, poolName string, limit int) ([]ScrubRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT host_id, pool_name, status, errors, started_at, ended_at
