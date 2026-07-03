@@ -6,96 +6,132 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/zfsdash/zfsdash/internal/zfs"
 )
 
-// DB wraps a SQLite database for ZFSdash history.
+// DB wraps a SQLite database for ZFSdash history
 type DB struct {
-	sql *sql.DB
+	sqlDB *sql.DB
 }
 
-// PoolHistory is a historical record of pool capacity.
-type PoolHistory struct {
-	ID        int64     `json:"id"`
-	Host      string    `json:"host"`
-	Pool      string    `json:"pool"`
-	Capacity  float64   `json:"capacity"`
-	Allocated uint64    `json:"allocated"`
-	Size      uint64    `json:"size"`
-	State     string    `json:"state"`
-	RecordedAt time.Time `json:"recorded_at"`
-}
-
-// Open opens (or creates) the SQLite database at path.
+// Open opens (or creates) the SQLite database at the given path
 func Open(path string) (*DB, error) {
 	if path == "" {
 		path = "/var/lib/zfsdash/history.db"
 	}
 	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
+		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	db := &DB{sql: sqlDB}
-	if err := db.migrate(); err != nil {
-		_ = sqlDB.Close()
+	d := &DB{sqlDB: sqlDB}
+	if err := d.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return db, nil
+	return d, nil
 }
 
 func (d *DB) migrate() error {
-	_, err := d.sql.Exec(`
-		CREATE TABLE IF NOT EXISTS pool_history (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			host        TEXT NOT NULL,
-			pool        TEXT NOT NULL,
-			capacity    REAL NOT NULL,
-			allocated   INTEGER NOT NULL,
-			size        INTEGER NOT NULL,
-			state       TEXT NOT NULL,
-			recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	_, err := d.sqlDB.Exec(`
+		CREATE TABLE IF NOT EXISTS pool_snapshots (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			host TEXT NOT NULL,
+			pool_name TEXT NOT NULL,
+			size INTEGER,
+			allocated INTEGER,
+			free INTEGER,
+			capacity INTEGER,
+			health TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
-		CREATE INDEX IF NOT EXISTS idx_pool_history_host_pool ON pool_history(host, pool);
-		CREATE INDEX IF NOT EXISTS idx_pool_history_recorded_at ON pool_history(recorded_at);
+		CREATE TABLE IF NOT EXISTS scrub_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			host TEXT NOT NULL,
+			pool_name TEXT NOT NULL,
+			start_time DATETIME,
+			end_time DATETIME,
+			duration_sec INTEGER,
+			errors INTEGER,
+			state TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_pool_snapshots_host_pool ON pool_snapshots(host, pool_name);
+		CREATE INDEX IF NOT EXISTS idx_scrub_history_host_pool ON scrub_history(host, pool_name);
 	`)
 	return err
 }
 
-// RecordPoolHistory inserts a pool capacity snapshot.
-func (d *DB) RecordPoolHistory(host, pool string, capacity float64, allocated, size uint64, state string) error {
-	_, err := d.sql.Exec(
-		`INSERT INTO pool_history (host, pool, capacity, allocated, size, state, recorded_at) VALUES (?,?,?,?,?,?,?)`,
-		host, pool, capacity, allocated, size, state, time.Now(),
+// RecordPoolSnapshot saves a pool state snapshot
+func (d *DB) RecordPoolSnapshot(host string, p *zfs.Pool) error {
+	_, err := d.sqlDB.Exec(
+		`INSERT INTO pool_snapshots (host, pool_name, size, allocated, free, capacity, health) VALUES (?,?,?,?,?,?,?)`,
+		host, p.Name, p.Size, p.Allocated, p.Free, p.Capacity, p.Health,
 	)
 	return err
 }
 
-// GetPoolHistory returns the last N records for a host+pool.
-func (d *DB) GetPoolHistory(host, pool string, limit int) ([]*PoolHistory, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := d.sql.Query(
-		`SELECT id, host, pool, capacity, allocated, size, state, recorded_at
-		 FROM pool_history WHERE host=? AND pool=?
-		 ORDER BY recorded_at DESC LIMIT ?`,
-		host, pool, limit,
+// RecordScrub saves a scrub history entry
+func (d *DB) RecordScrub(host, poolName string, s *zfs.Scrub) error {
+	_, err := d.sqlDB.Exec(
+		`INSERT INTO scrub_history (host, pool_name, start_time, end_time, duration_sec, errors, state) VALUES (?,?,?,?,?,?,?)`,
+		host, poolName, s.StartTime, s.EndTime, s.DurationSec, s.Errors, s.State,
+	)
+	return err
+}
+
+// GetPoolHistory returns pool snapshots for a host+pool, newest first, limited to n rows
+func (d *DB) GetPoolHistory(host, poolName string, n int) ([]*zfs.PoolSnapshot, error) {
+	rows, err := d.sqlDB.Query(
+		`SELECT id, pool_name, size, allocated, free, capacity, health, created_at
+		 FROM pool_snapshots WHERE host=? AND pool_name=?
+		 ORDER BY created_at DESC LIMIT ?`,
+		host, poolName, n,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*PoolHistory
+	var result []*zfs.PoolSnapshot
 	for rows.Next() {
-		r := &PoolHistory{}
-		if err := rows.Scan(&r.ID, &r.Host, &r.Pool, &r.Capacity, &r.Allocated, &r.Size, &r.State, &r.RecordedAt); err != nil {
+		s := &zfs.PoolSnapshot{}
+		var createdAt string
+		if err := rows.Scan(&s.ID, &s.PoolName, &s.Size, &s.Allocated, &s.Free, &s.Capacity, &s.Health, &createdAt); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		s.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		result = append(result, s)
 	}
-	return out, rows.Err()
+	return result, rows.Err()
 }
 
-// Close closes the database.
+// GetScrubHistory returns scrub history for a host+pool
+func (d *DB) GetScrubHistory(host, poolName string, n int) ([]*zfs.ScrubHistory, error) {
+	rows, err := d.sqlDB.Query(
+		`SELECT id, pool_name, start_time, end_time, duration_sec, errors, state, created_at
+		 FROM scrub_history WHERE host=? AND pool_name=?
+		 ORDER BY created_at DESC LIMIT ?`,
+		host, poolName, n,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []*zfs.ScrubHistory
+	for rows.Next() {
+		s := &zfs.ScrubHistory{}
+		var start, end, created string
+		if err := rows.Scan(&s.ID, &s.PoolName, &start, &end, &s.Duration, &s.Errors, &s.State, &created); err != nil {
+			return nil, err
+		}
+		s.StartTime, _ = time.Parse("2006-01-02 15:04:05", start)
+		s.EndTime, _ = time.Parse("2006-01-02 15:04:05", end)
+		s.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", created)
+		result = append(result, s)
+	}
+	return result, rows.Err()
+}
+
+// Close closes the database
 func (d *DB) Close() error {
-	return d.sql.Close()
+	return d.sqlDB.Close()
 }
