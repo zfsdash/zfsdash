@@ -9,7 +9,7 @@ import (
 	"unicode"
 )
 
-// parseUint64 converts a string to uint64, returning 0 for "-" or empty.
+// parseUint64 converts a tab-separated field to uint64.
 func parseUint64(s string) uint64 {
 	s = strings.TrimSpace(s)
 	if s == "-" || s == "" || s == "none" {
@@ -19,7 +19,7 @@ func parseUint64(s string) uint64 {
 	return v
 }
 
-// parseFloat64 converts a string to float64.
+// parseFloat64 converts a string (possibly ending in 'x') to float64.
 func parseFloat64(s string) float64 {
 	s = strings.TrimSpace(s)
 	s = strings.TrimSuffix(s, "x")
@@ -30,17 +30,13 @@ func parseFloat64(s string) float64 {
 	return v
 }
 
-// parseBool interprets "yes"/"on" as true.
+// parseBool maps yes/on/true/1 to true.
 func parseBool(s string) bool {
 	s = strings.ToLower(strings.TrimSpace(s))
 	return s == "yes" || s == "on" || s == "true" || s == "1"
 }
 
-// ParsePoolList parses the output of:
-//
-//	zpool list -H -p -o name,size,allocated,free,capacity,health[,guid]
-//
-// Note: 'state' is NOT a valid zpool list property. We infer state from health.
+// ParsePoolList parses `zpool list -H -p -o name,size,allocated,free,fragmentation,capacity,health`.
 func ParsePoolList(output string) ([]*Pool, error) {
 	var pools []*Pool
 	scanner := bufio.NewScanner(strings.NewReader(output))
@@ -50,38 +46,34 @@ func ParsePoolList(output string) ([]*Pool, error) {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) < 6 {
+		if len(fields) < 7 {
 			continue
 		}
-		health := strings.TrimSpace(fields[5])
-		pool := &Pool{
+		p := &Pool{
 			Name:      strings.TrimSpace(fields[0]),
-			State:     health, // state == health in ZFS terms
-			Health:    health,
 			Size:      parseUint64(fields[1]),
 			Allocated: parseUint64(fields[2]),
 			Free:      parseUint64(fields[3]),
+			Health:    strings.TrimSpace(fields[6]),
 			UpdatedAt: time.Now(),
 		}
-		// Capacity in fields[4] may be a raw integer (bytes used as pct) or percentage
-		capStr := strings.TrimSuffix(strings.TrimSpace(fields[4]), "%")
-		if v, err := strconv.ParseFloat(capStr, 64); err == nil {
-			// -pH returns raw fractional percent (0-100)
-			if v > 0 && v <= 1 {
-				v *= 100 // some versions return 0.xx
-			}
-			pool.Capacity = v
-		} else if pool.Size > 0 {
-			pool.Capacity = math.Round(float64(pool.Allocated)/float64(pool.Size)*10000) / 100
+		// fragmentation field (index 4) — strip % suffix
+		fragStr := strings.TrimSuffix(strings.TrimSpace(fields[4]), "%")
+		if fragStr != "-" && fragStr != "" {
+			v, _ := strconv.ParseFloat(fragStr, 64)
+			p.Fragmentation = v
 		}
-		pools = append(pools, pool)
+		if p.Size > 0 {
+			p.Capacity = math.Round(float64(p.Allocated)/float64(p.Size)*10000) / 100
+		}
+		// State mirrors Health for API consumers expecting both fields
+		p.State = p.Health
+		pools = append(pools, p)
 	}
 	return pools, scanner.Err()
 }
 
-// ParseDatasetList parses the output of:
-//
-//	zfs list -H -p -t filesystem,volume -o name,type,used,avail,refer,logicalused,mounted,mountpoint,compression,ratio,dedup,quota,reservation,volsize,encryption
+// ParseDatasetList parses `zfs list -H -p -t filesystem,volume -o name,type,used,avail,refer,...`.
 func ParseDatasetList(output string) ([]*Dataset, error) {
 	var datasets []*Dataset
 	scanner := bufio.NewScanner(strings.NewReader(output))
@@ -136,9 +128,7 @@ func ParseDatasetList(output string) ([]*Dataset, error) {
 	return datasets, scanner.Err()
 }
 
-// ParseSnapshotList parses snapshot lines from:
-//
-//	zfs list -H -p -t snapshot -o name,used,refer
+// ParseSnapshotList parses `zfs list -H -p -t snapshot -o name,used,refer`.
 func ParseSnapshotList(output string) ([]*Snapshot, error) {
 	var snaps []*Snapshot
 	scanner := bufio.NewScanner(strings.NewReader(output))
@@ -158,21 +148,19 @@ func ParseSnapshotList(output string) ([]*Snapshot, error) {
 		}
 		dataset := parts[0]
 		pool := strings.SplitN(dataset, "/", 2)[0]
-		snap := &Snapshot{
+		snaps = append(snaps, &Snapshot{
 			Name:       name,
 			Dataset:    dataset,
 			Pool:       pool,
 			Used:       parseUint64(fields[1]),
 			Referenced: parseUint64(fields[2]),
 			CreatedAt:  time.Now(),
-		}
-		snaps = append(snaps, snap)
+		})
 	}
 	return snaps, scanner.Err()
 }
 
-// ParseZpoolStatus parses the output of `zpool status <pool>` and updates
-// the ScrubStatus on the pool.
+// ParseZpoolStatus updates pool.ScrubStatus from `zpool status <pool>` output.
 func ParseZpoolStatus(output string, pool *Pool) {
 	if pool == nil {
 		return
@@ -180,14 +168,6 @@ func ParseZpoolStatus(output string, pool *Pool) {
 	scrub := &ScrubStatus{State: "none", Function: "none"}
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimLeftFunc(line, unicode.IsSpace)
-		// Extract state from status output
-		if strings.HasPrefix(trimmed, "state:") {
-			state := strings.TrimSpace(strings.TrimPrefix(trimmed, "state:"))
-			if state != "" {
-				pool.State = state
-				pool.Health = state
-			}
-		}
 		if !strings.HasPrefix(trimmed, "scan:") {
 			continue
 		}
@@ -222,5 +202,4 @@ func ParseZpoolStatus(output string, pool *Pool) {
 		}
 	}
 	pool.ScrubStatus = scrub
-	pool.ScanStatus = scrub
 }
