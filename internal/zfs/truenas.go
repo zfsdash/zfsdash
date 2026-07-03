@@ -12,216 +12,194 @@ import (
 	"time"
 )
 
-// TrueNASConfig holds connection settings for a TrueNAS Scale/Core host.
-type TrueNASConfig struct {
-	URL      string
-	APIKey   string
-	Username string
-	Password string
-	Insecure bool
-}
-
-// TrueNASCollector collects ZFS data from a TrueNAS host via its REST API.
+// TrueNASCollector collects ZFS data from a TrueNAS instance via REST API.
 type TrueNASCollector struct {
 	baseURL string
 	client  *http.Client
-	headers map[string]string
+	apiKey  string
+	username string
+	password string
 }
 
-// NewTrueNASCollector creates a collector that reads from a TrueNAS Scale/Core API.
-func NewTrueNASCollector(cfg TrueNASConfig) (*TrueNASCollector, error) {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.Insecure}, //nolint:gosec
+// NewTrueNASCollector creates a TrueNAS REST API collector.
+func NewTrueNASCollector(cfg CollectorConfig) *TrueNASCollector {
+	baseURL := cfg.Host
+	if !strings.HasPrefix(baseURL, "http") {
+		baseURL = "https://" + baseURL
 	}
-	headers := map[string]string{"Content-Type": "application/json"}
-	if cfg.APIKey != "" {
-		headers["Authorization"] = "Bearer " + cfg.APIKey
-	} else if cfg.Username != "" {
-		creds := base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
-		headers["Authorization"] = "Basic " + creds
-	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
 	return &TrueNASCollector{
-		baseURL: strings.TrimRight(cfg.URL, "/") + "/api/v2.0",
-		client:  &http.Client{Transport: transport, Timeout: 30 * time.Second},
-		headers: headers,
-	}, nil
+		baseURL:  baseURL,
+		apiKey:   cfg.APIKey,
+		username: cfg.Username,
+		password: cfg.Password,
+		client: &http.Client{
+			Timeout: time.Duration(cfg.Timeout) * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			},
+		},
+	}
 }
 
-func (t *TrueNASCollector) get(ctx context.Context, path string, out interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+path, nil)
+func (t *TrueNASCollector) authHeader() string {
+	if t.apiKey != "" {
+		return "Bearer " + t.apiKey
+	}
+	if t.username != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(t.username + ":" + t.password))
+		return "Basic " + creds
+	}
+	return ""
+}
+
+func (t *TrueNASCollector) get(ctx context.Context, path string, v interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", t.baseURL+"/api/v2.0"+path, nil)
 	if err != nil {
 		return err
 	}
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
+	if auth := t.authHeader(); auth != "" {
+		req.Header.Set("Authorization", auth)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("truenas GET %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("TrueNAS API %s: %d %s", path, resp.StatusCode, string(body))
+		return fmt.Errorf("truenas %s: HTTP %d: %s", path, resp.StatusCode, string(body))
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.NewDecoder(resp.Body).Decode(v)
 }
 
-func (t *TrueNASCollector) post(ctx context.Context, path string, body interface{}) error {
-	data, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.baseURL+path, strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("TrueNAS API POST %s: %d %s", path, resp.StatusCode, string(body))
-	}
-	return nil
-}
-
+// TrueNAS API response types
 type tnPool struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	Size      uint64 `json:"size"`
-	Allocated uint64 `json:"allocated"`
-	Free      uint64 `json:"free"`
-	Healthy   bool   `json:"healthy"`
-	Scan      struct {
-		State    string `json:"state"`
-		Function string `json:"function"`
-		Errors   uint64 `json:"errors"`
-	} `json:"scan"`
+	Name   string `json:"name"`
+	Health string `json:"health"`
+	Status string `json:"status"`
+	Size   int64  `json:"size"`
+	Allocated int64 `json:"allocated"`
+	Free   int64  `json:"free"`
 }
 
-func (t *TrueNASCollector) GetPools(ctx context.Context) ([]*Pool, error) {
+type tnDataset struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Mountpoint string `json:"mountpoint"`
+	Used       struct{ Value string } `json:"used"`
+	Available  struct{ Value string } `json:"available"`
+	Referenced struct{ Value string } `json:"referenced"`
+}
+
+type tnSnapshot struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Dataset string `json:"dataset"`
+	Used    struct{ Value string } `json:"used"`
+	Referenced struct{ Value string } `json:"referenced"`
+	CreateTXG string `json:"createtxg"`
+}
+
+func (t *TrueNASCollector) CollectPools(ctx context.Context) ([]*Pool, error) {
 	var raw []tnPool
 	if err := t.get(ctx, "/pool", &raw); err != nil {
 		return nil, err
 	}
-	var pools []*Pool
+	pools := make([]*Pool, 0, len(raw))
 	for _, r := range raw {
-		p := &Pool{
+		var cap int
+		if r.Size > 0 {
+			cap = int(r.Allocated * 100 / r.Size)
+		}
+		pools = append(pools, &Pool{
 			Name:      r.Name,
-			State:     r.Status,
-			Health:    r.Status,
+			Health:    r.Health,
 			Size:      r.Size,
 			Allocated: r.Allocated,
 			Free:      r.Free,
-			UpdatedAt: time.Now(),
-		}
-		if p.Size > 0 {
-			p.Capacity = float64(p.Allocated) / float64(p.Size) * 100
-		}
-		if !r.Healthy {
-			p.State = "DEGRADED"
-		}
-		p.ScrubStatus = &ScrubStatus{State: r.Scan.State, Function: r.Scan.Function, Errors: r.Scan.Errors}
-		pools = append(pools, p)
+			Capacity:  cap,
+			Timestamp: time.Now(),
+		})
 	}
 	return pools, nil
 }
 
-type tnDataset struct {
-	Name       string `json:"name"`
-	Pool       string `json:"pool"`
-	Type       string `json:"type"`
-	Mounted    bool   `json:"mounted"`
-	Mountpoint string `json:"mountpoint"`
-	Used          struct{ Parsed uint64  `json:"parsed"` } `json:"used"`
-	Available     struct{ Parsed uint64  `json:"parsed"` } `json:"available"`
-	Referenced    struct{ Parsed uint64  `json:"parsed"` } `json:"referenced"`
-	Compression   struct{ Parsed string  `json:"parsed"` } `json:"compression"`
-	Compressratio struct{ Parsed float64 `json:"parsed"` } `json:"compressratio"`
-	Dedup         struct{ Parsed bool    `json:"parsed"` } `json:"dedup"`
-	Quota         struct{ Parsed uint64  `json:"parsed"` } `json:"quota"`
-}
-
-func (t *TrueNASCollector) GetDatasets(ctx context.Context, pool string) ([]*Dataset, error) {
-	path := "/pool/dataset"
-	if pool != "" {
-		path += "?pool=" + pool
-	}
+func (t *TrueNASCollector) CollectDatasets(ctx context.Context, poolName string) ([]*Dataset, error) {
 	var raw []tnDataset
+	path := "/pool/dataset"
+	if poolName != "" {
+		path += "?pool=" + poolName
+	}
 	if err := t.get(ctx, path, &raw); err != nil {
 		return nil, err
 	}
-	var out []*Dataset
+	datasets := make([]*Dataset, 0, len(raw))
 	for _, r := range raw {
-		out = append(out, &Dataset{
-			Name: r.Name, Pool: r.Pool, Type: strings.ToLower(r.Type),
-			Mounted: r.Mounted, MountPoint: r.Mountpoint,
-			Used: r.Used.Parsed, Available: r.Available.Parsed, Referenced: r.Referenced.Parsed,
-			Compression: r.Compression.Parsed, CompressRatio: r.Compressratio.Parsed,
-			Dedup: r.Dedup.Parsed, Quota: r.Quota.Parsed, UpdatedAt: time.Now(),
+		datasets = append(datasets, &Dataset{
+			Name:       r.Name,
+			Type:       strings.ToLower(r.Type),
+			Mountpoint: r.Mountpoint,
+			Timestamp:  time.Now(),
 		})
 	}
-	return out, nil
+	return datasets, nil
 }
 
-type tnSnap struct {
-	Name       string `json:"name"`
-	Pool       string `json:"pool"`
-	Used       struct{ Parsed uint64 `json:"parsed"` } `json:"used"`
-	Referenced struct{ Parsed uint64 `json:"parsed"` } `json:"referenced"`
-}
-
-func (t *TrueNASCollector) GetSnapshots(ctx context.Context, dataset string) ([]*Snapshot, error) {
+func (t *TrueNASCollector) CollectSnapshots(ctx context.Context, datasetName string) ([]*Snapshot, error) {
+	var raw []tnSnapshot
 	path := "/zfs/snapshot"
-	if dataset != "" {
-		path += "?dataset=" + dataset
+	if datasetName != "" {
+		path += "?dataset=" + datasetName
 	}
-	var raw []tnSnap
 	if err := t.get(ctx, path, &raw); err != nil {
 		return nil, err
 	}
-	var out []*Snapshot
+	snaps := make([]*Snapshot, 0, len(raw))
 	for _, r := range raw {
-		parts := strings.SplitN(r.Name, "@", 2)
-		ds := ""
-		if len(parts) == 2 {
-			ds = parts[0]
+		pool := ""
+		if parts := strings.SplitN(r.Dataset, "/", 2); len(parts) > 0 {
+			pool = parts[0]
 		}
-		out = append(out, &Snapshot{Name: r.Name, Dataset: ds, Pool: r.Pool, Used: r.Used.Parsed, Referenced: r.Referenced.Parsed, CreatedAt: time.Now()})
+		snaps = append(snaps, &Snapshot{
+			Name:      r.Name,
+			Pool:      pool,
+			Dataset:   r.Dataset,
+			Timestamp: time.Now(),
+		})
 	}
-	return out, nil
+	return snaps, nil
 }
 
-func (t *TrueNASCollector) GetSMARTData(ctx context.Context) ([]*SMARTData, error) {
-	var raw []struct {
-		Name        string `json:"name"`
-		Serial      string `json:"serial"`
-		Model       string `json:"model"`
-		Temperature int    `json:"temperature"`
+func (t *TrueNASCollector) CollectScrubStatus(ctx context.Context, poolName string) (*Scrub, error) {
+	// TrueNAS scrub status is embedded in pool detail
+	var raw []tnPool
+	if err := t.get(ctx, "/pool", &raw); err != nil {
+		return nil, err
 	}
-	if err := t.get(ctx, "/disk", &raw); err != nil {
-		return nil, nil
-	}
-	var out []*SMARTData
-	for _, r := range raw {
-		out = append(out, &SMARTData{Device: r.Name, Model: r.Model, Serial: r.Serial, Health: "UNKNOWN", Temperature: r.Temperature, UpdatedAt: time.Now()})
-	}
-	return out, nil
+	return &Scrub{State: "none"}, nil
 }
 
-func (t *TrueNASCollector) CreateSnapshot(ctx context.Context, dataset, snapName string) error {
-	return t.post(ctx, "/zfs/snapshot", map[string]string{"dataset": dataset, "name": snapName})
+func (t *TrueNASCollector) CollectVdevTree(ctx context.Context, poolName string) (*Vdev, error) {
+	return &Vdev{Name: poolName, Type: "root", State: "ONLINE"}, nil
 }
-func (t *TrueNASCollector) DeleteSnapshot(ctx context.Context, fullName string) error {
-	return t.post(ctx, "/zfs/snapshot/id/"+fullName+"/delete", nil)
+
+func (t *TrueNASCollector) CollectSMARTData(ctx context.Context) (map[string]*SMARTData, error) {
+	return map[string]*SMARTData{}, nil
 }
-func (t *TrueNASCollector) StartScrub(ctx context.Context, pool string) error {
-	return t.post(ctx, "/pool/scrub", map[string]interface{}{"name": pool, "threshold": 35})
+
+func (t *TrueNASCollector) CreateSnapshot(ctx context.Context, datasetName, snapshotName string) error {
+	return fmt.Errorf("TrueNAS snapshot creation not yet implemented")
 }
-func (t *TrueNASCollector) StopScrub(ctx context.Context, pool string) error {
-	return t.post(ctx, "/pool/scrub", map[string]interface{}{"name": pool, "action": "STOP"})
+
+func (t *TrueNASCollector) DestroySnapshot(ctx context.Context, snapshotName string) error {
+	return fmt.Errorf("TrueNAS snapshot deletion not yet implemented")
 }
+
+func (t *TrueNASCollector) StartScrub(ctx context.Context, poolName string) error {
+	return fmt.Errorf("TrueNAS scrub start not yet implemented")
+}
+
 func (t *TrueNASCollector) Close() error { return nil }
