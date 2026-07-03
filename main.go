@@ -39,24 +39,29 @@ func main() {
 	alertMgr := alerts.New(cfg.Alerts)
 	collectors := make(web.CollectorMap)
 
+	// Build a collector for each configured host
 	for _, hostCfg := range cfg.Hosts {
 		col, err := buildCollector(hostCfg)
 		if err != nil {
-			log.Printf("[main] host %s: build collector: %v \u2014 skipping", hostCfg.Name, err)
+			log.Printf("[main] host %s: build collector: %v — skipping", hostCfg.Name, err)
 			continue
 		}
 		collectors[hostCfg.Name] = col
 		st.SetError(hostCfg.Name, "initializing...")
 	}
 
+	// Start background collection goroutine for each host
 	for name, col := range collectors {
 		go collectLoop(name, col, st, database, alertMgr)
 	}
 
+	// Build HTTP handler
 	apiHandler := web.New(st, database, collectors)
+
 	mux := http.NewServeMux()
 	mux.Handle("/api/", apiHandler)
 
+	// Try to serve embedded static files
 	staticFS, err := fs.Sub(web.Static, "static")
 	if err == nil {
 		mux.Handle("/", http.FileServer(http.FS(staticFS)))
@@ -66,7 +71,7 @@ func main() {
 				`<body style="background:#0f172a;color:#e2e8f0;font-family:monospace;padding:2rem">`+
 				`<h1>ZFS<span style="color:#60a5fa">dash</span></h1>`+
 				`<p>API is running. Build the frontend: <code>cd web && npm run build</code></p>`+
-				`<p><a href="/api/health" style="color:#60a5fa">/api/health</a> \u00b7 `+
+				`<p><a href="/api/health" style="color:#60a5fa">/api/health</a> · `+
 				`<a href="/api/hosts" style="color:#60a5fa">/api/hosts</a></p>`+
 				`</body></html>`)
 		})
@@ -126,7 +131,7 @@ func buildCollector(h config.HostConfig) (zfs.Collector, error) {
 			Username: h.TrueNAS.Username,
 			Password: h.TrueNAS.Password,
 			Insecure: h.TrueNAS.Insecure,
-		}), nil
+		})
 	default:
 		return nil, fmt.Errorf("unknown mode %q", h.Mode)
 	}
