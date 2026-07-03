@@ -6,132 +6,188 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-
-	"github.com/zfsdash/zfsdash/internal/zfs"
 )
 
-// DB wraps a SQLite database for ZFSdash history
-type DB struct {
-	sqlDB *sql.DB
+// Store is the SQLite-backed data store.
+type Store struct {
+	db *sql.DB
 }
 
-// Open opens (or creates) the SQLite database at the given path
-func Open(path string) (*DB, error) {
-	if path == "" {
-		path = "/var/lib/zfsdash/history.db"
-	}
-	sqlDB, err := sql.Open("sqlite", path)
+// New opens (or creates) the SQLite database at path.
+func New(path string) (*Store, error) {
+	conn, err := sql.Open("sqlite", path+"?_journal=WAL&_timeout=5000&_fk=true")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	d := &DB{sqlDB: sqlDB}
-	if err := d.migrate(); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
+	conn.SetMaxOpenConns(1) // SQLite: single writer
+	conn.SetMaxIdleConns(1)
+	conn.SetConnMaxLifetime(0)
+	return &Store{db: conn}, nil
+}
+
+// Close closes the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+// DB returns the underlying *sql.DB for use by sub-packages.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Migrate runs all schema migrations.
+func (s *Store) Migrate() error {
+	_, err := s.db.Exec(schema)
+	return err
+}
+
+// IsFirstRun returns true if no users exist yet.
+func (s *Store) IsFirstRun() (bool, error) {
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	if err != nil {
+		return false, err
 	}
-	return d, nil
+	return count == 0, nil
 }
 
-func (d *DB) migrate() error {
-	_, err := d.sqlDB.Exec(`
-		CREATE TABLE IF NOT EXISTS pool_snapshots (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			host TEXT NOT NULL,
-			pool_name TEXT NOT NULL,
-			size INTEGER,
-			allocated INTEGER,
-			free INTEGER,
-			capacity INTEGER,
-			health TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE TABLE IF NOT EXISTS scrub_history (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			host TEXT NOT NULL,
-			pool_name TEXT NOT NULL,
-			start_time DATETIME,
-			end_time DATETIME,
-			duration_sec INTEGER,
-			errors INTEGER,
-			state TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE INDEX IF NOT EXISTS idx_pool_snapshots_host_pool ON pool_snapshots(host, pool_name);
-		CREATE INDEX IF NOT EXISTS idx_scrub_history_host_pool ON scrub_history(host, pool_name);
-	`)
-	return err
+// --- User operations ---
+
+type User struct {
+	ID           string
+	Username     string
+	Email        string
+	PasswordHash string
+	IsAdmin      bool
+	IsActive     bool
+	CreatedAt    time.Time
 }
 
-// RecordPoolSnapshot saves a pool state snapshot
-func (d *DB) RecordPoolSnapshot(host string, p *zfs.Pool) error {
-	_, err := d.sqlDB.Exec(
-		`INSERT INTO pool_snapshots (host, pool_name, size, allocated, free, capacity, health) VALUES (?,?,?,?,?,?,?)`,
-		host, p.Name, p.Size, p.Allocated, p.Free, p.Capacity, p.Health,
+func (s *Store) CreateUser(id, username, email, passwordHash string, isAdmin bool) error {
+	_, err := s.db.Exec(
+		`INSERT INTO users (id, username, email, password_hash, is_admin) VALUES (?, ?, ?, ?, ?)`,
+		id, username, email, passwordHash, isAdmin,
 	)
 	return err
 }
 
-// RecordScrub saves a scrub history entry
-func (d *DB) RecordScrub(host, poolName string, s *zfs.Scrub) error {
-	_, err := d.sqlDB.Exec(
-		`INSERT INTO scrub_history (host, pool_name, start_time, end_time, duration_sec, errors, state) VALUES (?,?,?,?,?,?,?)`,
-		host, poolName, s.StartTime, s.EndTime, s.DurationSec, s.Errors, s.State,
+func (s *Store) GetUserByUsername(username string) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRow(
+		`SELECT id, username, email, password_hash, is_admin, is_active, created_at FROM users WHERE username = ? COLLATE NOCASE`,
+		username,
+	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.IsAdmin, &u.IsActive, &u.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return u, err
+}
+
+func (s *Store) GetUserByID(id string) (*User, error) {
+	u := &User{}
+	err := s.db.QueryRow(
+		`SELECT id, username, email, password_hash, is_admin, is_active, created_at FROM users WHERE id = ?`,
+		id,
+	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.IsAdmin, &u.IsActive, &u.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return u, err
+}
+
+// --- Session operations ---
+
+type Session struct {
+	ID        string
+	UserID    string
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+func (s *Store) CreateSession(id, userID string, expiresAt time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)`,
+		id, userID, expiresAt,
 	)
 	return err
 }
 
-// GetPoolHistory returns pool snapshots for a host+pool, newest first, limited to n rows
-func (d *DB) GetPoolHistory(host, poolName string, n int) ([]*zfs.PoolSnapshot, error) {
-	rows, err := d.sqlDB.Query(
-		`SELECT id, pool_name, size, allocated, free, capacity, health, created_at
-		 FROM pool_snapshots WHERE host=? AND pool_name=?
-		 ORDER BY created_at DESC LIMIT ?`,
-		host, poolName, n,
+func (s *Store) GetSession(id string) (*Session, error) {
+	sess := &Session{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, expires_at, created_at FROM sessions WHERE id = ? AND expires_at > datetime('now')`,
+		id,
+	).Scan(&sess.ID, &sess.UserID, &sess.ExpiresAt, &sess.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return sess, err
+}
+
+func (s *Store) DeleteSession(id string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) DeleteExpiredSessions() error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= datetime('now')`)
+	return err
+}
+
+// --- Host operations ---
+
+type Host struct {
+	ID          string
+	Name        string
+	Type        string // local, ssh, truenas
+	Hostname    string
+	Port        int
+	Username    string
+	Password    string
+	APIKey      string
+	Description string
+	IsActive    bool
+	CreatedAt   time.Time
+}
+
+func (s *Store) CreateHost(h *Host) error {
+	_, err := s.db.Exec(
+		`INSERT INTO hosts (id, name, type, hostname, port, username, password, api_key, description, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		h.ID, h.Name, h.Type, h.Hostname, h.Port, h.Username, h.Password, h.APIKey, h.Description, h.IsActive,
+	)
+	return err
+}
+
+func (s *Store) ListHosts() ([]*Host, error) {
+	rows, err := s.db.Query(
+		`SELECT id, name, type, hostname, port, username, password, api_key, description, is_active, created_at FROM hosts WHERE is_active = 1 ORDER BY name`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var result []*zfs.PoolSnapshot
+
+	var hosts []*Host
 	for rows.Next() {
-		s := &zfs.PoolSnapshot{}
-		var createdAt string
-		if err := rows.Scan(&s.ID, &s.PoolName, &s.Size, &s.Allocated, &s.Free, &s.Capacity, &s.Health, &createdAt); err != nil {
+		h := &Host{}
+		if err := rows.Scan(&h.ID, &h.Name, &h.Type, &h.Hostname, &h.Port, &h.Username, &h.Password, &h.APIKey, &h.Description, &h.IsActive, &h.CreatedAt); err != nil {
 			return nil, err
 		}
-		s.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
-		result = append(result, s)
+		hosts = append(hosts, h)
 	}
-	return result, rows.Err()
+	return hosts, rows.Err()
 }
 
-// GetScrubHistory returns scrub history for a host+pool
-func (d *DB) GetScrubHistory(host, poolName string, n int) ([]*zfs.ScrubHistory, error) {
-	rows, err := d.sqlDB.Query(
-		`SELECT id, pool_name, start_time, end_time, duration_sec, errors, state, created_at
-		 FROM scrub_history WHERE host=? AND pool_name=?
-		 ORDER BY created_at DESC LIMIT ?`,
-		host, poolName, n,
-	)
-	if err != nil {
-		return nil, err
+func (s *Store) GetHost(id string) (*Host, error) {
+	h := &Host{}
+	err := s.db.QueryRow(
+		`SELECT id, name, type, hostname, port, username, password, api_key, description, is_active, created_at FROM hosts WHERE id = ?`,
+		id,
+	).Scan(&h.ID, &h.Name, &h.Type, &h.Hostname, &h.Port, &h.Username, &h.Password, &h.APIKey, &h.Description, &h.IsActive, &h.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-	defer rows.Close()
-	var result []*zfs.ScrubHistory
-	for rows.Next() {
-		s := &zfs.ScrubHistory{}
-		var start, end, created string
-		if err := rows.Scan(&s.ID, &s.PoolName, &start, &end, &s.Duration, &s.Errors, &s.State, &created); err != nil {
-			return nil, err
-		}
-		s.StartTime, _ = time.Parse("2006-01-02 15:04:05", start)
-		s.EndTime, _ = time.Parse("2006-01-02 15:04:05", end)
-		s.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", created)
-		result = append(result, s)
-	}
-	return result, rows.Err()
+	return h, err
 }
 
-// Close closes the database
-func (d *DB) Close() error {
-	return d.sqlDB.Close()
+func (s *Store) DeleteHost(id string) error {
+	_, err := s.db.Exec(`UPDATE hosts SET is_active = 0 WHERE id = ?`, id)
+	return err
 }
