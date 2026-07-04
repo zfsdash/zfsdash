@@ -1,111 +1,135 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${ZFSDASH_VERSION:-latest}"
-INSTALL_DIR="/usr/local/bin"
-SERVICE_USER="zfsdash"
-DATA_DIR="/var/lib/zfsdash"
+VERSION="latest"
+AGENT_MODE=false
+TOKEN=""
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-info()    { echo -e "${BLUE}[ZFSdash]${NC} $*"; }
-success() { echo -e "${GREEN}[ZFSdash]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[ZFSdash]${NC} $*"; }
-error()   { echo -e "${RED}[ZFSdash]${NC} $*" >&2; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || error "Run as root: sudo bash install.sh"
+for arg in "$@"; do
+  case $arg in
+    --agent) AGENT_MODE=true ;;
+    --token=*) TOKEN="${arg#*=}" ;;
+    --version=*) VERSION="${arg#*=}" ;;
+  esac
+done
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  ARCH="amd64" ;;
+case $ARCH in
+  x86_64) ARCH="amd64" ;;
   aarch64|arm64) ARCH="arm64" ;;
-  *) error "Unsupported architecture: $ARCH" ;;
-esac
-case "$OS" in
-  linux)   PLATFORM="linux" ;;
-  freebsd) PLATFORM="freebsd" ;;
-  *) error "Unsupported OS: $OS" ;;
+  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-info "Detected: ${PLATFORM}/${ARCH}"
-
-if ! command -v zpool &>/dev/null; then
-  warn "zpool not found. ZFSdash will work but local ZFS pools won't be available."
+if [ "$OS" = "freebsd" ]; then
+  PLATFORM="freebsd-amd64"
+elif [ "$OS" = "linux" ]; then
+  PLATFORM="linux-${ARCH}"
 else
-  success "ZFS found"
+  echo "Unsupported OS: $OS"; exit 1
 fi
 
-if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash_${PLATFORM}_${ARCH}"
-else
-  URL="https://github.com/zfsdash/zfsdash/releases/download/${VERSION}/zfsdash_${PLATFORM}_${ARCH}"
-fi
+BINARY_URL="https://github.com/zfsdash/zfsdash/releases/${VERSION}/download/zfsdash-${PLATFORM}"
+INSTALL_DIR="/usr/local/bin"
 
-info "Downloading ZFSdash..."
-curl -fsSL "$URL" -o /tmp/zfsdash || error "Download failed. See https://github.com/zfsdash/zfsdash/releases"
+echo "==> Installing ZFSdash ($PLATFORM)"
+curl -fsSL "$BINARY_URL" -o /tmp/zfsdash
 chmod +x /tmp/zfsdash
-install -o root -g root -m 0755 /tmp/zfsdash "${INSTALL_DIR}/zfsdash"
-rm -f /tmp/zfsdash
-success "Installed to ${INSTALL_DIR}/zfsdash"
+mv /tmp/zfsdash "$INSTALL_DIR/zfsdash"
 
-if ! id "$SERVICE_USER" &>/dev/null; then
-  if [ "$PLATFORM" = "freebsd" ]; then
-    pw useradd -n "$SERVICE_USER" -d "$DATA_DIR" -s /usr/sbin/nologin -c "ZFSdash" 2>/dev/null || true
-  else
-    useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin --comment "ZFSdash" "$SERVICE_USER" 2>/dev/null || true
+if [ "$AGENT_MODE" = true ]; then
+  if [ -z "$TOKEN" ]; then
+    echo "Error: --token is required in agent mode"
+    exit 1
   fi
-fi
 
-mkdir -p "$DATA_DIR"
-chown "$SERVICE_USER" "$DATA_DIR" 2>/dev/null || true
-chmod 750 "$DATA_DIR"
+  echo "==> Installing ZFSdash agent service"
+  CLOUD_URL="https://app.zfsdash.com"
 
-if [ "$PLATFORM" = "freebsd" ]; then
-  cat > /etc/rc.d/zfsdash <<EOF
-#!/bin/sh
-# PROVIDE: zfsdash
-# REQUIRE: NETWORKING
-. /etc/rc.subr
-name="zfsdash"
-rcvar="zfsdash_enable"
-command="${INSTALL_DIR}/zfsdash"
-command_args="--data ${DATA_DIR} --listen 0.0.0.0:8080"
-zfsdash_user="${SERVICE_USER}"
-load_rc_config \$name
-run_rc_command "\$1"
-EOF
-  chmod +x /etc/rc.d/zfsdash
-  sysrc zfsdash_enable=YES
-  service zfsdash start
-else
-  cat > /etc/systemd/system/zfsdash.service <<EOF
+  if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
+    cat > /etc/systemd/system/zfsdash-agent.service <<EOF
 [Unit]
-Description=ZFSdash - ZFS Management Dashboard
+Description=ZFSdash Agent
 After=network.target
-Documentation=https://zfsdash.com
 
 [Service]
-Type=simple
-User=$SERVICE_USER
-ExecStart=${INSTALL_DIR}/zfsdash --data ${DATA_DIR} --listen 0.0.0.0:8080
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=${DATA_DIR}
-PrivateTmp=yes
+ExecStart=$INSTALL_DIR/zfsdash agent --token=${TOKEN} --cloud-url=${CLOUD_URL}
+Restart=always
+RestartSec=30
+Environment=HOME=/root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable zfsdash
-  systemctl restart zfsdash
-fi
+    systemctl daemon-reload
+    systemctl enable --now zfsdash-agent
+    echo "==> Agent started (systemd)"
 
-success "ZFSdash installed and running!"
-echo ""
-echo "  Open: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'SERVER_IP'):8080"
-echo "  Complete setup in the browser wizard."
-echo "  Docs: https://zfsdash.com/docs"
-echo ""
+  elif [ "$OS" = "freebsd" ]; then
+    cat > /etc/rc.d/zfsdash_agent <<EOF
+#!/bin/sh
+# PROVIDE: zfsdash_agent
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="zfsdash_agent"
+rcvar="zfsdash_agent_enable"
+command="$INSTALL_DIR/zfsdash"
+command_args="agent --token=${TOKEN} --cloud-url=${CLOUD_URL}"
+pidfile="/var/run/zfsdash_agent.pid"
+start_precmd="zfsdash_prestart"
+
+zfsdash_prestart() {
+  export HOME=/root
+}
+
+load_rc_config \$name
+run_rc_command "\$1"
+EOF
+    chmod +x /etc/rc.d/zfsdash_agent
+    sysrc zfsdash_agent_enable=YES
+    service zfsdash_agent start
+    echo "==> Agent started (rc.d)"
+  fi
+else
+  # Standalone dashboard mode
+  CONFIG_DIR="/etc/zfsdash"
+  mkdir -p "$CONFIG_DIR"
+
+  if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
+listen: :8080
+database: /var/lib/zfsdash/zfsdash.db
+hosts:
+  - name: localhost
+    mode: local
+EOF
+    mkdir -p /var/lib/zfsdash
+    echo "==> Config written to $CONFIG_DIR/config.yaml"
+  fi
+
+  if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
+    cat > /etc/systemd/system/zfsdash.service <<EOF
+[Unit]
+Description=ZFSdash
+After=network.target
+
+[Service]
+ExecStart=$INSTALL_DIR/zfsdash serve --config /etc/zfsdash/config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now zfsdash
+  fi
+
+  echo ""
+  echo "==> ZFSdash installed!"
+  echo "    Open http://localhost:8080 to get started"
+  echo "    Config: $CONFIG_DIR/config.yaml"
+fi
