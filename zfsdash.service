@@ -1,17 +1,36 @@
 [Unit]
 Description=ZFSdash ZFS Monitoring Daemon
-After=network.target
+Documentation=https://zfsdash.com
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=zfsdash
 Group=zfsdash
 WorkingDirectory=/opt/zfsdash
+
+# Kill anything holding port 8080 before starting
+ExecStartPre=-/usr/bin/bash -c 'fuser -k 8080/tcp 2>/dev/null || true'
+ExecStartPre=/usr/bin/bash -c 'sleep 1; c=0; while ss -tlnp | grep -q ":8080 " && [ $c -lt 20 ]; do sleep 0.5; c=$((c+1)); done'
+
 ExecStart=/opt/zfsdash/zfsdash -addr :8080 -data /var/lib/zfsdash
+
+# Graceful shutdown: SIGTERM then SIGKILL
+ExecStop=/usr/bin/bash -c 'kill -TERM $MAINPID 2>/dev/null; sleep 2; kill -KILL $MAINPID 2>/dev/null || true'
+
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/zfsdash/zfsdash.log
-StandardError=append:/var/log/zfsdash/zfsdash.log
+StartLimitInterval=60
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zfsdash
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
