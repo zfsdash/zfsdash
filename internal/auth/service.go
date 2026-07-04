@@ -2,105 +2,95 @@ package auth
 
 import (
 	"crypto/rand"
-	"database/sql"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/zfsdash/zfsdash/internal/db"
 )
 
-// Service handles user authentication.
+// Service provides authentication operations backed by db.Store.
 type Service struct {
-	db *sql.DB
+	store *db.Store
 }
 
-// NewService creates a new auth Service backed by the given database.
-func NewService(db *sql.DB) *Service {
-	_ = initSchema(db)
-	return &Service{db: db}
+// NewService creates a new auth Service.
+func NewService(store *db.Store) *Service {
+	return &Service{store: store}
 }
 
-func initSchema(db *sql.DB) error {
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			email TEXT UNIQUE NOT NULL,
-			password TEXT NOT NULL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE TABLE IF NOT EXISTS sessions (
-			token TEXT PRIMARY KEY,
-			user_id INTEGER NOT NULL,
-			expires_at DATETIME NOT NULL,
-			FOREIGN KEY(user_id) REFERENCES users(id)
-		);
-		CREATE TABLE IF NOT EXISTS config (
-			key TEXT PRIMARY KEY,
-			value TEXT
-		);
-	`)
-	return err
-}
-
-// Register creates a new user and returns a session token.
-func (s *Service) Register(email, password string) (string, error) {
+// CreateAdminUser creates the first admin user during wizard setup.
+func (s *Service) CreateAdminUser(username, email, password string) error {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return "", fmt.Errorf("hash password: %w", err)
+		return fmt.Errorf("hash password: %w", err)
 	}
-	res, err := s.db.Exec(`INSERT INTO users (email, password) VALUES (?, ?)`, email, string(hash))
-	if err != nil {
-		return "", fmt.Errorf("email already registered")
-	}
-	userID, _ := res.LastInsertId()
-	return s.createSession(userID)
+	id := uuid.New().String()
+	return s.store.CreateUser(id, username, email, string(hash), true)
 }
 
-// Login authenticates a user and returns a session token.
-func (s *Service) Login(email, password string) (string, error) {
-	var userID int64
-	var hash string
-	err := s.db.QueryRow(`SELECT id, password FROM users WHERE email = ?`, email).Scan(&userID, &hash)
-	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("invalid credentials")
-	}
+// Login authenticates by username+password and returns a plaintext session token.
+func (s *Service) Login(username, password string) (string, error) {
+	user, err := s.store.GetUserByUsername(username)
 	if err != nil {
 		return "", fmt.Errorf("db error: %w", err)
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+	if user == nil {
 		return "", fmt.Errorf("invalid credentials")
 	}
-	return s.createSession(userID)
-}
-
-// ValidateToken checks a session token and returns the user ID.
-func (s *Service) ValidateToken(token string) (int64, error) {
-	var userID int64
-	var expiresAt time.Time
-	err := s.db.QueryRow(`SELECT user_id, expires_at FROM sessions WHERE token = ?`, token).Scan(&userID, &expiresAt)
-	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("invalid token")
+	if !user.IsActive {
+		return "", fmt.Errorf("account disabled")
 	}
-	if err != nil {
-		return 0, fmt.Errorf("db error: %w", err)
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		return "", fmt.Errorf("invalid credentials")
 	}
-	if time.Now().After(expiresAt) {
-		return 0, fmt.Errorf("token expired")
-	}
-	return userID, nil
-}
-
-func (s *Service) createSession(userID int64) (string, error) {
+	// Generate random token.
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate token: %w", err)
 	}
-	token := hex.EncodeToString(b)
-	expiry := time.Now().Add(30 * 24 * time.Hour)
-	_, err := s.db.Exec(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)`, token, userID, expiry)
-	if err != nil {
+	plaintext := hex.EncodeToString(b)
+	tokenHash := hashToken(plaintext)
+	sessID := uuid.New().String()
+	expiry := time.Now().Add(7 * 24 * time.Hour)
+	if err := s.store.CreateSessionByHash(sessID, user.ID, tokenHash, expiry); err != nil {
 		return "", fmt.Errorf("create session: %w", err)
 	}
-	return token, nil
+	_ = s.store.TouchLastLogin(user.ID)
+	return plaintext, nil
+}
+
+// ValidateSession looks up a session by plaintext token and returns the user.
+// Returns (nil, nil) when no matching session exists.
+func (s *Service) ValidateSession(token string) (*db.User, error) {
+	tokenHash := hashToken(token)
+	sess, err := s.store.GetSessionByHash(tokenHash)
+	if err != nil {
+		return nil, fmt.Errorf("db error: %w", err)
+	}
+	if sess == nil {
+		return nil, nil
+	}
+	_ = s.store.TouchSessionActivity(sess.ID)
+	user, err := s.store.GetUserByID(sess.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("db error: %w", err)
+	}
+	return user, nil
+}
+
+// Logout deletes the session identified by the plaintext token.
+func (s *Service) Logout(token string) error {
+	return s.store.DeleteSessionByHash(hashToken(token))
+}
+
+// hashToken returns the SHA-256 hex digest of a plaintext session token.
+// Tokens are never stored in plaintext — only their hash is persisted.
+func hashToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
 }

@@ -2,44 +2,37 @@ package wizard
 
 import "database/sql"
 
-// SetupState holds the current wizard state.
+// SetupState describes the current wizard progress.
 type SetupState struct {
 	Complete  bool   `json:"complete"`
 	AdminSet  bool   `json:"admin_set"`
 	HostCount int    `json:"host_count"`
+	Version   string `json:"version"`
 }
 
-// IsSetupComplete returns true if the initial setup wizard has been completed.
+// IsSetupComplete returns true if at least one admin user exists.
 func IsSetupComplete(db *sql.DB) bool {
-	var val string
-	err := db.QueryRow(`SELECT value FROM config WHERE key = 'setup_complete'`).Scan(&val)
-	if err != nil {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE is_admin = 1`).Scan(&count); err != nil {
 		return false
 	}
-	return val == "1"
+	return count > 0
 }
 
-// GetSetupState returns the current setup progress.
-func GetSetupState(db *sql.DB) interface{} {
-	state := &SetupState{}
+// GetSetupState returns the current wizard progress.
+func GetSetupState(db *sql.DB, version string) interface{} {
+	state := &SetupState{Version: version}
 	state.Complete = IsSetupComplete(db)
 
-	// Check if an admin user exists.
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err == nil {
 		state.AdminSet = count > 0
 	}
-
-	// Check how many hosts are configured.
-	if err := db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&count); err == nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hosts WHERE is_active = 1`).Scan(&count); err == nil {
 		state.HostCount = count
 	}
-
 	return state
 }
 
-// CompleteSetup marks the wizard as done.
-func CompleteSetup(db *sql.DB) error {
-	_, err := db.Exec(`INSERT OR REPLACE INTO config (key, value) VALUES ('setup_complete', '1')`)
-	return err
-}
+// CompleteSetup is a no-op — setup completion is derived from user count.
+func CompleteSetup(db *sql.DB) error { return nil }
