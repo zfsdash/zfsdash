@@ -7,8 +7,7 @@ import (
 	"github.com/zfsdash/zfsdash/internal/zfs"
 )
 
-// HealthHandler handles GET /api/pools/{name}/health
-func (s *Server) HealthHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handlePoolHealth(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("name")
 	if poolName == "" {
 		http.Error(w, `{"error":"pool name required"}`, http.StatusBadRequest)
@@ -17,9 +16,7 @@ func (s *Server) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 	health, err := zfs.ParsePoolHealth(poolName)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		http.Error(w, `{"error":"failed to parse pool health"}`, http.StatusInternalServerError)
 		return
 	}
 
