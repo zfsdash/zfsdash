@@ -1,135 +1,124 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ZFSdash installer
+# Usage: curl -fsSL https://zfsdash.com/install.sh | sudo bash
+
 VERSION="latest"
-AGENT_MODE=false
-TOKEN=""
-
-for arg in "$@"; do
-  case $arg in
-    --agent) AGENT_MODE=true ;;
-    --token=*) TOKEN="${arg#*=}" ;;
-    --version=*) VERSION="${arg#*=}" ;;
-  esac
-done
-
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-case $ARCH in
-  x86_64) ARCH="amd64" ;;
-  aarch64|arm64) ARCH="arm64" ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
-
-if [ "$OS" = "freebsd" ]; then
-  PLATFORM="freebsd-amd64"
-elif [ "$OS" = "linux" ]; then
-  PLATFORM="linux-${ARCH}"
-else
-  echo "Unsupported OS: $OS"; exit 1
-fi
-
-BINARY_URL="https://github.com/zfsdash/zfsdash/releases/${VERSION}/download/zfsdash-${PLATFORM}"
+GITHUB_REPO="zfsdash/zfsdash"
 INSTALL_DIR="/usr/local/bin"
+SERVICE_NAME="zfsdash"
+DATA_DIR="/var/lib/zfsdash"
+PORT="8080"
 
-echo "==> Installing ZFSdash ($PLATFORM)"
-curl -fsSL "$BINARY_URL" -o /tmp/zfsdash
-chmod +x /tmp/zfsdash
-mv /tmp/zfsdash "$INSTALL_DIR/zfsdash"
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-if [ "$AGENT_MODE" = true ]; then
-  if [ -z "$TOKEN" ]; then
-    echo "Error: --token is required in agent mode"
-    exit 1
-  fi
+log_info()  { echo -e "${GREEN}[zfsdash]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[zfsdash]${NC} $*"; }
+log_error() { echo -e "${RED}[zfsdash]${NC} $*" >&2; }
 
-  echo "==> Installing ZFSdash agent service"
-  CLOUD_URL="https://app.zfsdash.com"
-
-  if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
-    cat > /etc/systemd/system/zfsdash-agent.service <<EOF
-[Unit]
-Description=ZFSdash Agent
-After=network.target
-
-[Service]
-ExecStart=$INSTALL_DIR/zfsdash agent --token=${TOKEN} --cloud-url=${CLOUD_URL}
-Restart=always
-RestartSec=30
-Environment=HOME=/root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable --now zfsdash-agent
-    echo "==> Agent started (systemd)"
-
-  elif [ "$OS" = "freebsd" ]; then
-    cat > /etc/rc.d/zfsdash_agent <<EOF
-#!/bin/sh
-# PROVIDE: zfsdash_agent
-# REQUIRE: NETWORKING
-# KEYWORD: shutdown
-
-. /etc/rc.subr
-
-name="zfsdash_agent"
-rcvar="zfsdash_agent_enable"
-command="$INSTALL_DIR/zfsdash"
-command_args="agent --token=${TOKEN} --cloud-url=${CLOUD_URL}"
-pidfile="/var/run/zfsdash_agent.pid"
-start_precmd="zfsdash_prestart"
-
-zfsdash_prestart() {
-  export HOME=/root
+detect_platform() {
+  local os arch
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64)  arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) log_error "Unsupported arch: $arch"; exit 1 ;;
+  esac
+  case "$os" in
+    linux)   OS="linux" ;;
+    freebsd) OS="freebsd" ;;
+    *) log_error "Unsupported OS: $os"; exit 1 ;;
+  esac
+  ARCH="$arch"
+  PLATFORM="${OS}-${ARCH}"
+  log_info "Detected: $PLATFORM"
 }
 
-load_rc_config \$name
-run_rc_command "\$1"
-EOF
-    chmod +x /etc/rc.d/zfsdash_agent
-    sysrc zfsdash_agent_enable=YES
-    service zfsdash_agent start
-    echo "==> Agent started (rc.d)"
+get_latest_version() {
+  if [ "$VERSION" = "latest" ]; then
+    VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+      | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    [ -z "$VERSION" ] && { log_error "Could not fetch latest version"; exit 1; }
+    log_info "Latest version: $VERSION"
   fi
-else
-  # Standalone dashboard mode
-  CONFIG_DIR="/etc/zfsdash"
-  mkdir -p "$CONFIG_DIR"
+}
 
-  if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
-    cat > "$CONFIG_DIR/config.yaml" <<EOF
-listen: :8080
-database: /var/lib/zfsdash/zfsdash.db
-hosts:
-  - name: localhost
-    mode: local
-EOF
-    mkdir -p /var/lib/zfsdash
-    echo "==> Config written to $CONFIG_DIR/config.yaml"
-  fi
+download_binary() {
+  local url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/zfsdash-${PLATFORM}"
+  local tmp="/tmp/zfsdash-download"
+  log_info "Downloading zfsdash ${VERSION}..."
+  curl -fsSL "$url" -o "$tmp" || { log_error "Download failed: $url"; exit 1; }
+  chmod +x "$tmp"
+  mv "$tmp" "${INSTALL_DIR}/zfsdash"
+  log_info "Installed to ${INSTALL_DIR}/zfsdash"
+}
 
-  if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
-    cat > /etc/systemd/system/zfsdash.service <<EOF
+setup_dirs() {
+  mkdir -p "$DATA_DIR"
+}
+
+install_systemd() {
+  cat > /etc/systemd/system/zfsdash.service <<EOF
 [Unit]
-Description=ZFSdash
+Description=ZFSdash - ZFS Management Dashboard
 After=network.target
 
 [Service]
-ExecStart=$INSTALL_DIR/zfsdash serve --config /etc/zfsdash/config.yaml
-Restart=always
+Type=simple
+ExecStart=${INSTALL_DIR}/zfsdash --data-dir=${DATA_DIR} --port=${PORT}
+Restart=on-failure
 RestartSec=5
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now zfsdash
-  fi
+  systemctl daemon-reload
+  systemctl enable --now zfsdash
+  log_info "systemd service installed and started"
+}
 
+install_rcd() {
+  cat > /etc/rc.d/zfsdash <<EOF
+#!/bin/sh
+# PROVIDE: zfsdash
+# REQUIRE: NETWORKING
+. /etc/rc.subr
+name="zfsdash"
+rcvar="zfsdash_enable"
+command="${INSTALL_DIR}/zfsdash"
+command_args="--data-dir=${DATA_DIR} --port=${PORT}"
+load_rc_config \$name
+: \${zfsdash_enable:=no}
+run_rc_command "\$1"
+EOF
+  chmod +x /etc/rc.d/zfsdash
+  echo 'zfsdash_enable="YES"' >> /etc/rc.conf
+  service zfsdash start
+  log_info "rc.d service installed and started"
+}
+
+main() {
+  [ "$(id -u)" -ne 0 ] && { log_error "Run as root (use sudo)"; exit 1; }
+  log_info "Installing ZFSdash..."
+  detect_platform
+  get_latest_version
+  setup_dirs
+  download_binary
+  case "$OS" in
+    linux)   install_systemd ;;
+    freebsd) install_rcd ;;
+  esac
   echo ""
-  echo "==> ZFSdash installed!"
-  echo "    Open http://localhost:8080 to get started"
-  echo "    Config: $CONFIG_DIR/config.yaml"
-fi
+  echo -e "${GREEN}ZFSdash ${VERSION} installed!${NC}"
+  echo -e "Open ${BLUE}http://localhost:${PORT}${NC} to complete setup"
+  echo ""
+}
+
+main "$@"
