@@ -1,68 +1,83 @@
 package web
 
 import (
+	"io/fs"
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 )
 
-// RegisterRoutes adds all API routes to the chi router.
-// Called from handler.go after Handler is constructed.
-func (h *Handler) RegisterRoutes(r chi.Router) {
-	// Setup / wizard
+func SetupRoutes(r chi.Router, h *Handler, staticFS fs.FS) {
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Public routes
 	r.Get("/api/setup/state", h.handleSetupState)
 	r.Post("/api/setup/admin", h.handleSetupAdmin)
 	r.Post("/api/setup/host", h.handleSetupHost)
-
-	// Pools
-	r.Get("/api/pools", h.handlePools)
-	r.Get("/api/pools/{pool}/health", h.handlePoolHealth)
-	r.Get("/api/pools/{pool}/iostat", h.handleIOStat)
-	r.Get("/api/pools/{pool}/capacity-trend", h.handleCapacityTrend)
-	r.Get("/api/pools/{pool}/scrub/stream", h.handleScrubStream)
-	r.Get("/api/pools/{pool}/faulted", h.handleFaultedDevices)
-	r.Post("/api/pools/{pool}/replace", h.handleDriveReplace)
-	r.Get("/api/pools/{pool}/resilver", h.handleResilverStatus)
-
-	// Datasets + Snapshots
-	r.Get("/api/datasets", h.handleDatasets)
-	r.Get("/api/snapshots", h.handleSnapshots)
-	r.Post("/api/snapshots", h.handleCreateSnapshot)
-	r.Delete("/api/snapshots/{name}", h.handleDeleteSnapshot)
-
-	// ARC + metrics
-	r.Get("/api/arc", h.handleARC)
+	r.Post("/api/auth/login", h.handleLogin)
+	r.Get("/api/health", h.handleHealth)
 	r.Get("/metrics", h.handleMetrics)
 
-	// Replication
-	r.Get("/api/replication/jobs", h.handleReplList)
-	r.Post("/api/replication/estimate", h.handleReplEstimate)
-	r.Post("/api/replication/start", h.handleReplStart)
-	r.Get("/api/replication/{jobID}", h.handleReplStatus)
-	r.Get("/api/replication/{jobID}/stream", h.handleReplStream)
+	// Protected routes
+	r.Group(func(r chi.Router) {
+		r.Use(h.requireAuth)
 
-	// Simulator
-	r.Post("/api/simulator/rebalance", h.handleSimulatorRebalance)
+		// Pools
+		r.Get("/api/pools", h.handleListPools)
+		r.Get("/api/pools/{pool}/datasets", h.handleListDatasets)
+		r.Get("/api/pools/{pool}/snapshots", h.handleListSnapshots)
+		r.Post("/api/pools/{pool}/snapshots", h.handleCreateSnapshot)
+		r.Delete("/api/pools/{pool}/snapshots/{snapshot}", h.handleDeleteSnapshot)
+		r.Post("/api/pools/{pool}/scrub", h.handleStartScrub)
+		r.Get("/api/pools/{pool}/scrub/stream", h.handleScrubStream)
+		r.Get("/api/pools/{pool}/health", h.handlePoolHealth)
+		r.Get("/api/pools/{pool}/forecast", h.handleForecast)
+		r.Get("/api/pools/{pool}/iostat", h.handleIOStat)
+		r.Get("/api/pools/{pool}/capacity-trend", h.handleCapacityTrend)
+		r.Get("/api/pools/{pool}/vdev/{vdev}/health", h.handleVdevHealth)
+		r.Get("/api/pools/{pool}/checksum-audit", h.handleChecksumAudit)
 
-	// Alerts
-	r.Get("/api/alerts", h.handleAlerts)
-	r.Post("/api/alerts", h.handleCreateAlert)
-	r.Delete("/api/alerts/{id}", h.handleDeleteAlert)
+		// Vdevs
+		r.Get("/api/vdev/health", h.handleAllVdevHealth)
+		r.Post("/api/vdev/collect", h.handleVdevCollect)
+		r.Post("/api/pools/{pool}/replace", h.handleDriveReplace)
+		r.Get("/api/pools/{pool}/resilver/status", h.handleResilverStatus)
 
-	// Auth
-	r.Post("/api/auth/login", h.handleLogin)
-	r.Post("/api/auth/logout", h.handleLogout)
-	r.Get("/api/auth/me", h.handleMe)
+		// ARC
+		r.Get("/api/arc", h.handleARC)
+		r.Get("/api/arc/anomalies", h.handleARCAnomalies)
 
-	// Users (admin only)
-	r.Get("/api/users", h.handleListUsers)
-	r.Post("/api/users", h.handleCreateUser)
-	r.Delete("/api/users/{id}", h.handleDeleteUser)
+		// Alerts
+		r.Get("/api/alerts", h.handleListAlerts)
+		r.Post("/api/alerts", h.handleCreateAlert)
+		r.Delete("/api/alerts/{id}", h.handleDeleteAlert)
 
-	// Hosts
-	r.Get("/api/hosts", h.handleListHosts)
-	r.Post("/api/hosts", h.handleAddHost)
-	r.Delete("/api/hosts/{id}", h.handleDeleteHost)
+		// Users (admin only)
+		r.Get("/api/users", h.handleListUsers)
+		r.Post("/api/users", h.handleCreateUser)
+		r.Delete("/api/users/{id}", h.handleDeleteUser)
 
-	// Health check
-	r.Get("/api/health", h.handleHealth)
-	r.Get("/api/setup/state", h.handleSetupState)
+		// Hosts
+		r.Get("/api/hosts", h.handleListHosts)
+		r.Post("/api/hosts", h.handleAddHost)
+		r.Delete("/api/hosts/{id}", h.handleDeleteHost)
+
+		// Send/Receive
+		r.Post("/api/replication/send", h.handleStartSend)
+		r.Get("/api/replication/jobs", h.handleListSendJobs)
+		r.Get("/api/replication/jobs/{id}", h.handleGetSendJob)
+		r.Get("/api/replication/jobs/{id}/progress", h.handleSendJobProgress)
+		r.Post("/api/replication/jobs/{id}/cancel", h.handleCancelSendJob)
+		r.Get("/api/replication/estimate", h.handleEstimateSendSize)
+	})
+
+	// Static files
+	r.Handle("/*", http.FileServer(http.FS(staticFS)))
 }
