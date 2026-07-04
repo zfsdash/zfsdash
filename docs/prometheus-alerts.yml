@@ -1,0 +1,122 @@
+# /etc/prometheus/rules/zfsdash.yml
+# ZFSdash ZFS pool health and performance monitoring alerts
+# Copy to your Prometheus rules directory and reload Prometheus
+
+groups:
+  - name: zfsdash.pool_health
+    interval: 30s
+    rules:
+      - alert: ZFSPoolDegraded
+        expr: zfs_pool_state{state="degraded"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }} is DEGRADED"
+          description: |
+            Pool {{ $labels.pool }} has entered degraded state.
+            One or more vdevs have failed but the pool is still operational.
+            Investigate and replace failed devices immediately.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Pool-Degraded"
+
+      - alert: ZFSPoolFaulted
+        expr: zfs_pool_state{state="faulted"} > 0
+        for: 2m
+        labels:
+          severity: critical
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }} is FAULTED — CRITICAL"
+          description: |
+            Pool {{ $labels.pool }} is FAULTED and offline.
+            IMMEDIATE ACTION REQUIRED — data is inaccessible.
+            Run: zpool status {{ $labels.pool }}
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Pool-Faulted"
+
+      - alert: ZFSPoolCapacityHigh
+        expr: zfs_pool_used_bytes / zfs_pool_size_bytes > 0.80
+        for: 10m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }} capacity > 80% ({{ $value | humanizePercentage }})"
+          description: |
+            Pool {{ $labels.pool }} is {{ $value | humanizePercentage }} full.
+            ZFS performance degrades above 80%. Plan storage expansion.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/High-Capacity"
+
+      - alert: ZFSPoolCapacityCritical
+        expr: zfs_pool_used_bytes / zfs_pool_size_bytes > 0.95
+        for: 5m
+        labels:
+          severity: critical
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }} capacity CRITICAL > 95%"
+          description: |
+            Pool {{ $labels.pool }} is {{ $value | humanizePercentage }} full.
+            Write failures are imminent. Free space or expand pool IMMEDIATELY.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Critical-Capacity"
+
+  - name: zfsdash.fragmentation
+    interval: 1m
+    rules:
+      - alert: ZFSPoolFragmentationHigh
+        expr: zfs_pool_fragmentation_percent > 50
+        for: 30m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }} fragmentation > 50% ({{ $value }}%)"
+          description: |
+            Pool {{ $labels.pool }} has {{ $value }}% fragmentation.
+            High fragmentation degrades sequential I/O performance.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Fragmentation"
+
+  - name: zfsdash.arc
+    interval: 30s
+    rules:
+      - alert: ZFSARCHitRatioLow
+        expr: zfs_arc_hits / (zfs_arc_hits + zfs_arc_misses) < 0.70
+        for: 15m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS ARC hit ratio low: {{ $value | humanizePercentage }} (target >70%)"
+          description: |
+            ARC hit ratio is {{ $value | humanizePercentage }}.
+            Working set may exceed ARC size. Consider increasing arc_max.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/ARC-Tuning"
+
+  - name: zfsdash.scrub_resilver
+    interval: 1m
+    rules:
+      - alert: ZFSScrubErrorsDetected
+        expr: zfs_pool_scrub_errors > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS pool {{ $labels.pool }}: {{ $value }} scrub errors"
+          description: |
+            Pool {{ $labels.pool }} has {{ $value }} scrub errors.
+            Run: zpool status -v {{ $labels.pool }}
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Scrub-Errors"
+
+      - alert: ZFSResiverLongRunning
+        expr: zfs_pool_resilver_seconds > 86400 and zfs_pool_resilver_progress < 100
+        for: 1m
+        labels:
+          severity: warning
+          component: zfs
+        annotations:
+          summary: "ZFS resilver on {{ $labels.pool }} running >24h"
+          description: |
+            Resilver on {{ $labels.pool }} has been running for >24 hours.
+            Check for slow disk performance or hardware errors.
+          runbook_url: "https://github.com/zfsdash/zfsdash/wiki/Resilver-Stuck"

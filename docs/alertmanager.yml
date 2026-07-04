@@ -1,0 +1,67 @@
+# Alertmanager configuration for ZFSdash alerts
+# Replace placeholder values (marked with <>) with your actual config
+
+global:
+  smtp_smarthost: '<SMTP_HOST>:587'
+  smtp_from: 'alerts@<YOUR_DOMAIN>'
+  smtp_auth_username: '<SMTP_USER>'
+  smtp_auth_password: '<SMTP_PASSWORD>'
+  smtp_require_tls: true
+
+route:
+  group_by: ['alertname', 'pool']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'email-default'
+
+  routes:
+    # Critical alerts get immediate notification + Slack
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Warning alerts go to email only
+    - match:
+        severity: warning
+      receiver: 'email-default'
+      repeat_interval: 4h
+
+receivers:
+  - name: 'email-default'
+    email_configs:
+      - to: '<ALERT_EMAIL>'
+        subject: '[ZFSdash] {{ .GroupLabels.alertname }} - {{ .Status | toUpper }}'
+        body: |
+          {{ range .Alerts }}
+          Alert: {{ .Annotations.summary }}
+          Description: {{ .Annotations.description }}
+          Pool: {{ .Labels.pool }}
+          Severity: {{ .Labels.severity }}
+          Runbook: {{ .Annotations.runbook_url }}
+          ---
+          {{ end }}
+        send_resolved: true
+
+  - name: 'critical-alerts'
+    email_configs:
+      - to: '<ALERT_EMAIL>'
+        subject: '[ZFSdash CRITICAL] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    # Uncomment to add Slack notifications:
+    # slack_configs:
+    #   - api_url: '<SLACK_WEBHOOK_URL>'
+    #     channel: '#zfs-alerts'
+    #     title: '{{ .GroupLabels.alertname }} — {{ .Status | toUpper }}'
+    #     text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+    #     send_resolved: true
+
+inhibit_rules:
+  # Suppress warning alerts when critical alert for same pool is firing
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['pool']
