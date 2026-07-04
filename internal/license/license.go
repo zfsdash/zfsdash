@@ -1,102 +1,106 @@
 package license
 
 import (
-	"encoding/json"
-	"errors"
-	"io"
-	"net/http"
-	"regexp"
-	"sync"
+	"os"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
-var licenseKeyRegex = regexp.MustCompile(`^zfd_[a-f0-9]{32}$`)
-
-var (
-	ErrInvalidFormat    = errors.New("invalid license key format")
-	ErrValidationFailed = errors.New("license validation failed")
-)
-
-type Plan string
+type Tier string
 
 const (
-	PlanFree       Plan = "free"
-	PlanCloud      Plan = "cloud"
-	PlanEnterprise Plan = "enterprise"
+	TierFree       Tier = "free"
+	TierCloud      Tier = "cloud"
+	TierEnterprise Tier = "enterprise"
 )
 
-type Info struct {
-	Plan       Plan      `json:"plan"`
-	Features   []string  `json:"features"`
-	ValidUntil time.Time `json:"valid_until"`
-	Valid      bool      `json:"valid"`
+type License struct {
+	Tier      Tier
+	Seats     int
+	Org       string
+	ExpiresAt time.Time
+	Valid     bool
 }
 
-func (i Info) HasFeature(f string) bool {
-	for _, feat := range i.Features {
-		if feat == f {
-			return true
+type claims struct {
+	Tier  string `json:"tier"`
+	Seats int    `json:"seats"`
+	Org   string `json:"org"`
+	jwt.RegisteredClaims
+}
+
+func Validate(key string) License {
+	if key == "" {
+		return freeTier()
+	}
+
+	secret := os.Getenv("ZFSDASH_LICENSE_SECRET")
+	if secret == "" {
+		return freeTier()
+	}
+
+	c := &claims{}
+	token, err := jwt.ParseWithClaims(key, c, func(token *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	})
+	if err != nil || !token.Valid {
+		return freeTier()
+	}
+
+	tier := TierFree
+	seats := 1
+	switch c.Tier {
+	case "cloud":
+		tier = TierCloud
+		seats = 5
+		if c.Seats > 0 {
+			seats = c.Seats
+		}
+	case "enterprise":
+		tier = TierEnterprise
+		seats = 9999
+		if c.Seats > 0 {
+			seats = c.Seats
 		}
 	}
-	return false
-}
 
-type cache struct {
-	info      Info
-	expiresAt time.Time
-}
+	expiresAt := time.Now().Add(365 * 24 * time.Hour)
+	if c.ExpiresAt != nil {
+		expiresAt = c.ExpiresAt.Time
+	}
 
-type Manager struct {
-	validationURL string
-	mu            sync.RWMutex
-	caches        map[string]cache
-}
-
-func NewManager(validationURL string) *Manager {
-	return &Manager{
-		validationURL: validationURL,
-		caches:        make(map[string]cache),
+	return License{
+		Tier:      tier,
+		Seats:     seats,
+		Org:       c.Org,
+		ExpiresAt: expiresAt,
+		Valid:     expiresAt.After(time.Now()),
 	}
 }
 
-func (m *Manager) Validate(key string) (Info, error) {
-	if key == "" {
-		return Info{Plan: PlanFree, Valid: true, Features: []string{}}, nil
-	}
-	if !licenseKeyRegex.MatchString(key) {
-		return Info{}, ErrInvalidFormat
-	}
-	m.mu.RLock()
-	if c, ok := m.caches[key]; ok && time.Now().Before(c.expiresAt) {
-		m.mu.RUnlock()
-		return c.info, nil
-	}
-	m.mu.RUnlock()
-
-	info, err := m.validateRemote(key)
-	if err != nil {
-		return Info{}, err
-	}
-	m.mu.Lock()
-	m.caches[key] = cache{info: info, expiresAt: time.Now().Add(24 * time.Hour)}
-	m.mu.Unlock()
-	return info, nil
+func freeTier() License {
+	return License{Tier: TierFree, Seats: 1, Valid: false}
 }
 
-func (m *Manager) validateRemote(key string) (Info, error) {
-	req, _ := http.NewRequest("GET", m.validationURL, nil)
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", "ZFSdash/1.0")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return Info{}, err
+func Current() License {
+	return Validate(os.Getenv("ZFSDASH_LICENSE_KEY"))
+}
+
+func IsEnterprise() bool {
+	l := Current()
+	return l.Tier == TierEnterprise && l.Valid
+}
+
+func IsCloud() bool {
+	l := Current()
+	return l.Tier == TierCloud && l.Valid
+}
+
+func MaxUsers() int {
+	l := Current()
+	if !l.Valid {
+		return 1
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var info Info
-	if err := json.Unmarshal(body, &info); err != nil {
-		return Info{}, ErrValidationFailed
-	}
-	return info, nil
+	return l.Seats
 }

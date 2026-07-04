@@ -1,45 +1,53 @@
 package platform
 
-import "runtime"
-
-type OS string
-
-const (
-	Linux   OS = "linux"
-	FreeBSD OS = "freebsd"
-	Unknown OS = "unknown"
+import (
+	"os"
+	"runtime"
 )
 
-func Current() OS {
+type Platform struct {
+	OS           string
+	ZpoolPath    string
+	ZfsPath      string
+	SmartctlPath string
+	IsFreeBSD    bool
+	IsLinux      bool
+}
+
+func Detect() Platform {
+	p := Platform{
+		OS: runtime.GOOS,
+	}
+
 	switch runtime.GOOS {
-	case "linux":
-		return Linux
 	case "freebsd":
-		return FreeBSD
+		p.IsFreeBSD = true
+		p.ZpoolPath = findBinary([]string{"/sbin/zpool", "/usr/local/sbin/zpool"})
+		p.ZfsPath = findBinary([]string{"/sbin/zfs", "/usr/local/sbin/zfs"})
+		p.SmartctlPath = findBinary([]string{"/usr/local/sbin/smartctl", "/usr/sbin/smartctl"})
+	case "linux":
+		p.IsLinux = true
+		p.ZpoolPath = findBinary([]string{"/usr/sbin/zpool", "/usr/local/sbin/zpool"})
+		p.ZfsPath = findBinary([]string{"/usr/sbin/zfs", "/usr/local/sbin/zfs"})
+		p.SmartctlPath = findBinary([]string{"/usr/sbin/smartctl", "/usr/local/sbin/smartctl"})
 	default:
-		return Unknown
+		// Fallback: try common paths
+		p.ZpoolPath = findBinary([]string{"/usr/sbin/zpool", "/sbin/zpool", "/usr/local/sbin/zpool"})
+		p.ZfsPath = findBinary([]string{"/usr/sbin/zfs", "/sbin/zfs", "/usr/local/sbin/zfs"})
+		p.SmartctlPath = findBinary([]string{"/usr/sbin/smartctl", "/usr/local/sbin/smartctl"})
 	}
+
+	return p
 }
 
-func ZpoolBin() string {
-	if Current() == FreeBSD {
-		return "/sbin/zpool"
+func findBinary(paths []string) string {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
 	}
-	return "/usr/sbin/zpool"
-}
-
-func ZfsBin() string {
-	if Current() == FreeBSD {
-		return "/sbin/zfs"
+	if len(paths) > 0 {
+		return paths[0]
 	}
-	return "/usr/sbin/zfs"
+	return ""
 }
-
-func SmartctlBin() string {
-	if Current() == FreeBSD {
-		return "/usr/local/sbin/smartctl"
-	}
-	return "/usr/sbin/smartctl"
-}
-
-func IsFreeBSD() bool { return Current() == FreeBSD }

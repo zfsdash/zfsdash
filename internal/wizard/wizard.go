@@ -4,125 +4,113 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"time"
+	"strings"
 
 	"github.com/zfsdash/zfsdash/internal/auth"
 )
 
-type State string
-
-const (
-	StatePending      State = "pending"
-	StateAdminCreated State = "admin_created"
-	StateHostAdded    State = "host_added"
-	StateComplete     State = "complete"
-)
-
-type Wizard struct {
-	db   *sql.DB
-	auth *auth.Manager
-}
-
-func NewWizard(db *sql.DB, authMgr *auth.Manager) *Wizard {
-	initSchema(db)
-	return &Wizard{db: db, auth: authMgr}
-}
-
-func initSchema(db *sql.DB) {
-	db.Exec(`CREATE TABLE IF NOT EXISTS setup_state (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		state TEXT NOT NULL DEFAULT 'pending',
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+func InitSchema(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS setup_state (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
 	)`)
-	db.Exec(`INSERT OR IGNORE INTO setup_state (id, state) VALUES (1, 'pending')`)
+	return err
 }
 
-func (w *Wizard) GetState() State {
-	var state State
-	w.db.QueryRow(`SELECT state FROM setup_state WHERE id = 1`).Scan(&state)
-	if state == "" {
-		return StatePending
-	}
-	return state
-}
-
-func (w *Wizard) setState(s State) {
-	w.db.Exec(`UPDATE setup_state SET state = ?, updated_at = ? WHERE id = 1`, s, time.Now())
-}
-
-func (w *Wizard) IsComplete() bool {
-	return w.GetState() == StateComplete
-}
-
-func (w *Wizard) HandleStatus(rw http.ResponseWriter, r *http.Request) {
-	state := w.GetState()
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]interface{}{
-		"state":    state,
-		"complete": state == StateComplete,
-	})
-}
-
-func (w *Wizard) HandleCreateAdmin(rw http.ResponseWriter, r *http.Request) {
-	if w.GetState() != StatePending {
-		http.Error(rw, `{"error":"admin already created"}`, http.StatusConflict)
-		return
-	}
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" || req.Password == "" {
-		http.Error(rw, `{"error":"email and password required"}`, http.StatusBadRequest)
-		return
-	}
-	if len(req.Password) < 8 {
-		http.Error(rw, `{"error":"password must be at least 8 characters"}`, http.StatusBadRequest)
-		return
-	}
-	user, err := w.auth.CreateUser(req.Email, req.Password)
+func IsComplete(db *sql.DB) bool {
+	var value string
+	err := db.QueryRow("SELECT value FROM setup_state WHERE key = 'completed'").Scan(&value)
 	if err != nil {
-		http.Error(rw, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
-		return
+		return false
 	}
-	w.setState(StateAdminCreated)
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]interface{}{"ok": true, "user": user})
+	return value == "true"
 }
 
-func (w *Wizard) HandleAddHost(rw http.ResponseWriter, r *http.Request) {
-	if w.GetState() != StateAdminCreated {
-		http.Error(rw, `{"error":"create admin first"}`, http.StatusConflict)
-		return
-	}
-	var req struct {
-		Name string `json:"name"`
-		Mode string `json:"mode"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Mode == "" {
-		http.Error(rw, `{"error":"mode required (local, ssh, truenas)"}`, http.StatusBadRequest)
-		return
-	}
-	w.setState(StateComplete)
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]interface{}{"ok": true, "state": StateComplete})
+func MarkComplete(db *sql.DB) error {
+	_, err := db.Exec("INSERT INTO setup_state (key, value) VALUES ('completed', 'true') ON CONFLICT(key) DO UPDATE SET value = 'true'")
+	return err
 }
 
-// Middleware redirects to /setup if wizard not complete
-func (w *Wizard) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		if !w.IsComplete() && !isSetupPath(r.URL.Path) {
-			http.Redirect(rw, r, "/setup", http.StatusSeeOther)
+type SetupStatusResponse struct {
+	Completed    bool `json:"completed"`
+	AdminCreated bool `json:"adminCreated"`
+}
+
+func SetupStatusHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		next.ServeHTTP(rw, r)
-	})
+		completed := IsComplete(db)
+		adminCreated := false
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE role = 'admin'").Scan(&count); err == nil && count > 0 {
+			adminCreated = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(SetupStatusResponse{Completed: completed, AdminCreated: adminCreated})
+	}
 }
 
-func isSetupPath(path string) bool {
-	return path == "/setup" ||
-		path == "/api/setup/status" ||
-		path == "/api/setup/admin" ||
-		path == "/api/setup/host" ||
-		path == "/api/health"
+type setupAdminReq struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type setupAdminResp struct {
+	Token string `json:"token"`
+}
+
+func SetupAdminHandler(db *sql.DB, am *auth.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if IsComplete(db) {
+			http.Error(w, "Setup already complete", http.StatusConflict)
+			return
+		}
+		var req setupAdminReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.Email == "" || req.Password == "" {
+			http.Error(w, "Email and password required", http.StatusBadRequest)
+			return
+		}
+		_, err := am.CreateUser(req.Email, req.Password, "admin")
+		if err != nil {
+			http.Error(w, "Failed to create admin: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		token, err := am.AuthenticateUser(req.Email, req.Password)
+		if err != nil {
+			http.Error(w, "Failed to create session: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := MarkComplete(db); err != nil {
+			http.Error(w, "Failed to mark setup complete: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(setupAdminResp{Token: token})
+	}
+}
+
+func RequireSetup(db *sql.DB, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/setup/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !IsComplete(db) {
+			http.Redirect(w, r, "/setup", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
