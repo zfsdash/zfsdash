@@ -24,30 +24,26 @@ import (
 )
 
 const (
-	// sessionCookieName is the httponly cookie carrying the session token.
 	sessionCookieName = "zfsdash_session"
-	// sessionMaxAge is the cookie Max-Age in seconds (7 days).
-	sessionMaxAge = 7 * 24 * 60 * 60
+	sessionMaxAge     = 7 * 24 * 60 * 60
 )
 
-// contextKey is a private type for values stored in request context.
 type contextKey int
 
 const ctxKeyUser contextKey = iota
 
 // Handler holds all dependencies for HTTP handlers.
 type Handler struct {
-	dbStore     *db.Store         // SQLite persistence
-	authSvc     *auth.Service     // authentication
-	alertEngine *alerts.Engine    // alert evaluation (may be nil)
-	memStore    *store.Store      // in-memory ZFS data cache (may be nil)
-	collectors  map[string]zfs.Collector // live ZFS collectors (may be nil)
+	dbStore     *db.Store
+	authSvc     *auth.Service
+	alertEngine *alerts.Engine
+	memStore    *store.Store
+	collectors  map[string]zfs.Collector
 	cfg         *config.Config
 	version     string
 }
 
 // RegisterRoutes mounts all ZFSdash routes onto r.
-// Called from main.go after the router is configured with middleware.
 func RegisterRoutes(
 	r chi.Router,
 	dbStore *db.Store,
@@ -62,7 +58,6 @@ func RegisterRoutes(
 		version: "dev",
 	}
 
-	// CORS — credentials:true so the session cookie is forwarded on API calls.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -71,26 +66,21 @@ func RegisterRoutes(
 		MaxAge:           300,
 	}))
 
-	// First-run guard: redirect to /setup until an admin account exists.
 	r.Use(h.setupGuard)
 
-	// ── Public routes (no session required) ──────────────────────────────────
-
-	// Setup wizard endpoints.
+	// Public routes
 	r.Route("/api/setup", func(r chi.Router) {
 		r.Get("/state", h.handleSetupState)
 		r.Post("/init", h.handleSetupInit)
 	})
 
-	// Auth endpoints.
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/login", h.handleLogin)
 		r.Post("/logout", h.handleLogout)
-		// /api/auth/me MUST return 200 always — never 401 (browser Basic Auth popup).
+		// MUST return 200 always — 401 triggers browser Basic Auth popup
 		r.Get("/me", h.handleMe)
 	})
 
-	// Serve the SPA for setup and all other browser routes.
 	if staticFS != nil {
 		fileServer := http.FileServer(http.FS(staticFS))
 		r.Handle("/setup", fileServer)
@@ -98,7 +88,7 @@ func RegisterRoutes(
 		r.Handle("/*", fileServer)
 	}
 
-	// ── Protected routes (valid session cookie required) ─────────────────────
+	// Protected routes
 	r.Group(func(r chi.Router) {
 		r.Use(h.requireAuth)
 
@@ -121,13 +111,9 @@ func RegisterRoutes(
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-// setupGuard redirects any non-setup/auth request to /setup when no admin
-// account exists yet. API requests receive a JSON 503 instead of a redirect.
 func (h *Handler) setupGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-
-		// Always pass through setup, auth, and the setup UI itself.
 		if strings.HasPrefix(path, "/api/setup") ||
 			strings.HasPrefix(path, "/api/auth") ||
 			path == "/setup" ||
@@ -135,8 +121,6 @@ func (h *Handler) setupGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		// If setup is incomplete, redirect browser or return 503 for API.
 		if h.dbStore != nil && !wizard.IsSetupComplete(h.dbStore.DB()) {
 			if strings.HasPrefix(path, "/api/") {
 				jsonError(w, "setup required", http.StatusServiceUnavailable)
@@ -145,14 +129,12 @@ func (h *Handler) setupGuard(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/setup", http.StatusFound)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
 
-// requireAuth validates the session cookie and injects the authenticated user
-// into the request context. Returns 403 (not 401) to avoid the browser's
-// built-in Basic Auth credential popup.
+// requireAuth validates the session cookie. Returns 403 (not 401) to avoid
+// the browser Basic Auth credential popup.
 func (h *Handler) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := readSessionCookie(r)
@@ -160,13 +142,9 @@ func (h *Handler) requireAuth(next http.Handler) http.Handler {
 			jsonError(w, "authentication required", http.StatusForbidden)
 			return
 		}
-		user, err := h.authSvc.ValidateSession(token)
-		if err != nil {
+		_, user, err := h.authSvc.ValidateSession(token)
+		if err != nil || user == nil {
 			slog.Warn("session validation error", "err", err)
-			jsonError(w, "authentication required", http.StatusForbidden)
-			return
-		}
-		if user == nil {
 			jsonError(w, "authentication required", http.StatusForbidden)
 			return
 		}
@@ -211,16 +189,16 @@ func (h *Handler) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authSvc.CreateAdminUser(req.Username, req.Email, req.Password); err != nil {
+	if _, err := h.authSvc.CreateAdminUser(req.Username, req.Email, req.Password); err != nil {
 		slog.Error("create admin user", "err", err)
 		jsonError(w, "failed to create admin user", http.StatusInternalServerError)
 		return
 	}
 
-	// Log the new admin in immediately and hand back a session cookie.
-	token, err := h.authSvc.Login(req.Username, req.Password)
+	// Auto-login after setup
+	token, _, err := h.authSvc.Login(req.Username, req.Password)
 	if err != nil {
-		slog.Error("auto-login after setup init", "err", err)
+		slog.Error("auto-login after setup", "err", err)
 		jsonError(w, "account created but auto-login failed", http.StatusInternalServerError)
 		return
 	}
@@ -243,14 +221,12 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-
-	token, err := h.authSvc.Login(req.Username, req.Password)
+	token, _, err := h.authSvc.Login(req.Username, req.Password)
 	if err != nil {
-		// 403 not 401 — 401 triggers the browser Basic Auth popup.
+		// 403 not 401 — 401 triggers browser Basic Auth popup
 		jsonError(w, "invalid username or password", http.StatusForbidden)
 		return
 	}
-
 	writeSessionCookie(w, token)
 	jsonOK(w, map[string]string{"status": "ok"})
 }
@@ -266,16 +242,14 @@ func (h *Handler) handleLogout(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
-// handleMe returns the current user or {"user": null}.
-// This endpoint ALWAYS returns HTTP 200 — returning 401 would cause browsers
-// to show a native Basic Auth credential popup.
+// handleMe returns current user or {"user": null}. ALWAYS returns HTTP 200.
 func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
 	token := readSessionCookie(r)
 	if token == "" {
 		jsonOK(w, map[string]interface{}{"user": nil})
 		return
 	}
-	user, err := h.authSvc.ValidateSession(token)
+	_, user, err := h.authSvc.ValidateSession(token)
 	if err != nil || user == nil {
 		jsonOK(w, map[string]interface{}{"user": nil})
 		return
@@ -283,7 +257,7 @@ func (h *Handler) handleMe(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"user": safeUser(user)})
 }
 
-// ── ZFS handlers (unchanged from original) ────────────────────────────────────
+// ── ZFS handlers ──────────────────────────────────────────────────────────────
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "ok", "version": h.version})
@@ -534,7 +508,6 @@ func writeSessionCookie(w http.ResponseWriter, token string) {
 		MaxAge:   sessionMaxAge,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		// Set Secure:true in production when serving over TLS.
 	})
 }
 
@@ -551,7 +524,6 @@ func clearSessionCookie(w http.ResponseWriter) {
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 
-// safeUser converts a db.User to a JSON-safe map (no password hash).
 func safeUser(u *db.User) map[string]interface{} {
 	if u == nil {
 		return nil
