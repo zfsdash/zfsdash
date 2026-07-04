@@ -3,155 +3,199 @@ package wizard
 import (
 	"database/sql"
 	"encoding/json"
-	"log/slog"
+	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
-// State tracks setup wizard progress, persisted in SQLite.
-type State struct {
-	Complete  bool   `json:"complete"`
-	Step      int    `json:"step"`
-	AdminSet  bool   `json:"admin_set"`
-	HostAdded bool   `json:"host_added"`
-	Version   string `json:"version"`
-}
-
-// Wizard handles the first-run setup flow.
 type Wizard struct {
-	db      *sql.DB
-	version string
+	db *sql.DB
 }
 
-func New(db *sql.DB, version string) *Wizard {
-	return &Wizard{db: db, version: version}
+type StatusResponse struct {
+	Complete bool   `json:"complete"`
+	Step     string `json:"step"`
 }
 
-// IsComplete returns true if setup has been completed.
-func (w *Wizard) IsComplete() bool {
-	var count int
-	err := w.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+type SetupRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Email    string `json:"email"`
+}
+
+type HostRequest struct {
+	Name     string `json:"name"`
+	Address  string `json:"address"`
+	Mode     string `json:"mode"`   // local, ssh, truenas
+	Username string `json:"username"`
+	SSHKey   string `json:"ssh_key"`
+	APIKey   string `json:"api_key"`
+}
+
+func New(db *sql.DB) *Wizard {
+	return &Wizard{db: db}
+}
+
+func (w *Wizard) InitSchema() error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS settings (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS hosts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		address TEXT NOT NULL,
+		mode TEXT NOT NULL DEFAULT 'local',
+		username TEXT,
+		ssh_key TEXT,
+		api_key TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS admin_users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		email TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+	_, err := w.db.Exec(schema)
+	return err
+}
+
+func (w *Wizard) Status(rw http.ResponseWriter, r *http.Request) {
+	if err := w.InitSchema(); err != nil {
+		http.Error(rw, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	var wizardComplete string
+	err := w.db.QueryRow("SELECT value FROM settings WHERE key='wizard_complete'").Scan(&wizardComplete)
+	if err == sql.ErrNoRows {
+		rw.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(rw).Encode(StatusResponse{Complete: false, Step: "admin_setup"})
+		return
+	}
 	if err != nil {
-		return false
-	}
-	return count > 0
-}
-
-// HandleStatus returns current wizard state.
-func (w *Wizard) HandleStatus(rw http.ResponseWriter, r *http.Request) {
-	complete := w.IsComplete()
-	step := 1
-	if complete {
-		step = 3
-	}
-
-	var hostCount int
-	_ = w.db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hostCount)
-	if hostCount > 0 && complete {
-		step = 3
-	} else if complete {
-		step = 2
-	}
-
-	state := State{
-		Complete:  complete,
-		Step:      step,
-		AdminSet:  complete,
-		HostAdded: hostCount > 0,
-		Version:   w.version,
+		http.Error(rw, "Database error", http.StatusInternalServerError)
+		return
 	}
 
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(state)
+	json.NewEncoder(rw).Encode(StatusResponse{Complete: wizardComplete == "true", Step: "complete"})
 }
 
-// HandleCreateAdmin creates the first admin user.
-func (w *Wizard) HandleCreateAdmin(rw http.ResponseWriter, r *http.Request) {
-	if w.IsComplete() {
-		http.Error(rw, "setup already complete", http.StatusConflict)
-		return
-	}
-
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
+func (w *Wizard) Setup(rw http.ResponseWriter, r *http.Request) {
+	var req SetupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(rw, "invalid request", http.StatusBadRequest)
+		http.Error(rw, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Email == "" || len(req.Password) < 8 {
-		http.Error(rw, "email required and password must be at least 8 characters", http.StatusBadRequest)
+	if req.Username == "" || req.Password == "" {
+		http.Error(rw, "Username and password required", http.StatusBadRequest)
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(rw, "internal error", http.StatusInternalServerError)
+		http.Error(rw, "Password hashing failed", http.StatusInternalServerError)
 		return
 	}
 
-	_, err = w.db.ExecContext(r.Context(),
-		`INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)`,
-		req.Email, string(hash), time.Now().UTC().Format(time.RFC3339),
-	)
+	tx, err := w.db.Begin()
 	if err != nil {
-		slog.Error("create admin", "err", err)
-		http.Error(rw, "failed to create admin user", http.StatusInternalServerError)
+		http.Error(rw, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec("INSERT INTO admin_users (username, password_hash, email) VALUES (?, ?, ?)",
+		req.Username, string(hash), req.Email)
+	if err != nil {
+		http.Error(rw, "Admin user creation failed (user may already exist)", http.StatusConflict)
 		return
 	}
 
-	slog.Info("admin user created", "email", req.Email)
+	_, err = tx.Exec("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('wizard_complete', 'true', ?)",
+		time.Now())
+	if err != nil {
+		http.Error(rw, "Settings update failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		http.Error(rw, "Transaction commit failed", http.StatusInternalServerError)
+		return
+	}
+
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]interface{}{"ok": true, "email": req.Email})
+	rw.WriteHeader(http.StatusCreated)
+	json.NewEncoder(rw).Encode(map[string]string{"status": "ok", "message": "Admin account created"})
 }
 
-// HandleAddHost adds the first ZFS host.
-func (w *Wizard) HandleAddHost(rw http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name string `json:"name"`
-		Mode string `json:"mode"` // local, ssh, truenas
-		Host string `json:"host"`
-		User string `json:"user"`
-		Key  string `json:"ssh_key"`
-	}
+func (w *Wizard) AddHost(rw http.ResponseWriter, r *http.Request) {
+	var req HostRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(rw, "invalid request", http.StatusBadRequest)
+		http.Error(rw, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" {
-		req.Name = "localhost"
+	if req.Name == "" || req.Address == "" {
+		http.Error(rw, "Name and address required", http.StatusBadRequest)
+		return
 	}
 	if req.Mode == "" {
 		req.Mode = "local"
 	}
 
-	// Store SSH key to temp file if provided
-	keyPath := ""
-	if req.Key != "" {
-		f, err := os.CreateTemp("", "zfsdash-key-*")
-		if err == nil {
-			f.WriteString(req.Key)
-			f.Close()
-			os.Chmod(f.Name(), 0600)
-			keyPath = f.Name()
-		}
-	}
-
-	_, err := w.db.ExecContext(r.Context(),
-		`INSERT OR REPLACE INTO hosts (name, mode, host, user, key_path, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		req.Name, req.Mode, req.Host, req.User, keyPath, time.Now().UTC().Format(time.RFC3339),
+	_, err := w.db.Exec(
+		"INSERT INTO hosts (name, address, mode, username, ssh_key, api_key) VALUES (?, ?, ?, ?, ?, ?)",
+		req.Name, req.Address, req.Mode, req.Username, req.SSHKey, req.APIKey,
 	)
 	if err != nil {
-		slog.Error("add host", "err", err)
-		http.Error(rw, "failed to add host", http.StatusInternalServerError)
+		http.Error(rw, fmt.Sprintf("Host creation failed: %v", err), http.StatusConflict)
 		return
 	}
 
-	slog.Info("host added", "name", req.Name, "mode", req.Mode)
 	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]interface{}{"ok": true, "name": req.Name, "mode": req.Mode})
+	rw.WriteHeader(http.StatusCreated)
+	json.NewEncoder(rw).Encode(map[string]string{"status": "ok", "message": "Host added"})
+}
+
+func (w *Wizard) ListHosts(rw http.ResponseWriter, r *http.Request) {
+	rows, err := w.db.Query("SELECT id, name, address, mode, username, created_at FROM hosts ORDER BY created_at ASC")
+	if err != nil {
+		http.Error(rw, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Host struct {
+		ID        int    `json:"id"`
+		Name      string `json:"name"`
+		Address   string `json:"address"`
+		Mode      string `json:"mode"`
+		Username  string `json:"username"`
+		CreatedAt string `json:"created_at"`
+	}
+
+	var hosts []Host
+	for rows.Next() {
+		var h Host
+		if err := rows.Scan(&h.ID, &h.Name, &h.Address, &h.Mode, &h.Username, &h.CreatedAt); err != nil {
+			continue
+		}
+		hosts = append(hosts, h)
+	}
+
+	if hosts == nil {
+		hosts = []Host{}
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(rw).Encode(hosts)
 }

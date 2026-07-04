@@ -3,178 +3,169 @@ package agent
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 )
 
-// MetricsPayload is sent to app.zfsdash.com every 60 seconds.
-type MetricsPayload struct {
-	HostID    string        `json:"host_id"`
-	Hostname  string        `json:"hostname"`
-	Timestamp int64         `json:"timestamp"`
-	Pools     []PoolMetrics `json:"pools"`
-	Agent     AgentInfo     `json:"agent"`
-	License   string        `json:"license_key"`
+type Config struct {
+	Token     string
+	ServerURL string
+	Interval  time.Duration
 }
 
-type PoolMetrics struct {
+type PoolSummary struct {
 	Name      string  `json:"name"`
 	Size      uint64  `json:"size"`
-	Allocated uint64  `json:"allocated"`
+	Used      uint64  `json:"used"`
 	Free      uint64  `json:"free"`
-	Capacity  float64 `json:"capacity"`
 	Health    string  `json:"health"`
-	Datasets  int     `json:"datasets"`
-	Snapshots int     `json:"snapshots"`
-	Errors    int     `json:"errors"`
+	UsedPct   float64 `json:"used_pct"`
+	Timestamp int64   `json:"timestamp"`
 }
 
-type AgentInfo struct {
-	Version string `json:"version"`
-	OS      string `json:"os"`
-	Arch    string `json:"arch"`
-	Uptime  int64  `json:"uptime"`
+type Collector interface {
+	GetPools(ctx context.Context) ([]PoolSummary, error)
 }
 
-type CommandResponse struct {
-	Commands  []Command `json:"commands"`
-	NextPoll  int       `json:"next_poll_seconds"`
-}
-
-type Command struct {
-	ID     string                 `json:"id"`
-	Action string                 `json:"action"`
-	Params map[string]interface{} `json:"params"`
+type Registration struct {
+	AgentID string `json:"agent_id"`
+	Secret  string `json:"secret"`
 }
 
 type Agent struct {
-	hostID       string
-	hostname     string
-	cloudURL     string
-	licenseKey   string
-	pollInterval time.Duration
-	version      string
-	startTime    time.Time
-	client       *http.Client
-	metricsFunc  func(ctx context.Context) ([]PoolMetrics, error)
-	commandFunc  func(cmd Command) error
+	cfg    Config
+	db     *sql.DB
+	reg    *Registration
+	client *http.Client
+	logger *slog.Logger
 }
 
-func New(
-	hostID, hostname, cloudURL, licenseKey, version string,
-	metricsFunc func(ctx context.Context) ([]PoolMetrics, error),
-	commandFunc func(cmd Command) error,
-) *Agent {
+func New(cfg Config, db *sql.DB) *Agent {
 	return &Agent{
-		hostID:       hostID,
-		hostname:     hostname,
-		cloudURL:     cloudURL,
-		licenseKey:   licenseKey,
-		pollInterval: 60 * time.Second,
-		version:      version,
-		startTime:    time.Now(),
-		metricsFunc:  metricsFunc,
-		commandFunc:  commandFunc,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		cfg:    cfg,
+		db:     db,
+		client: &http.Client{Timeout: 15 * time.Second},
+		logger: slog.Default(),
 	}
 }
 
-func (a *Agent) Start(ctx context.Context) error {
-	slog.Info("agent starting", "host_id", a.hostID, "cloud_url", a.cloudURL)
-	ticker := time.NewTicker(a.pollInterval)
-	defer ticker.Stop()
-	// Send immediately on start
-	if err := a.poll(ctx); err != nil {
-		slog.Warn("initial poll failed", "err", err)
+func (a *Agent) initSchema() error {
+	_, err := a.db.Exec(`CREATE TABLE IF NOT EXISTS agent_registration (
+		agent_id TEXT NOT NULL,
+		secret TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+	return err
+}
+
+func (a *Agent) getOrRegister(ctx context.Context) (*Registration, error) {
+	if err := a.initSchema(); err != nil {
+		return nil, fmt.Errorf("init schema: %w", err)
 	}
+
+	var reg Registration
+	err := a.db.QueryRowContext(ctx, "SELECT agent_id, secret FROM agent_registration LIMIT 1").
+		Scan(&reg.AgentID, &reg.Secret)
+	if err == nil {
+		return &reg, nil
+	}
+
+	// Register with server
+	body, _ := json.Marshal(map[string]string{"token": a.cfg.Token})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.ServerURL+"/api/agent/register", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("register request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("register failed: HTTP %d", resp.StatusCode)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		return nil, fmt.Errorf("decode register response: %w", err)
+	}
+
+	_, err = a.db.ExecContext(ctx, "INSERT INTO agent_registration (agent_id, secret) VALUES (?, ?)",
+		reg.AgentID, reg.Secret)
+	if err != nil {
+		return nil, fmt.Errorf("save registration: %w", err)
+	}
+
+	a.logger.Info("agent registered", "agent_id", reg.AgentID)
+	return &reg, nil
+}
+
+func (a *Agent) sendHeartbeat(ctx context.Context, pools []PoolSummary) error {
+	payload := map[string]interface{}{
+		"agent_id": a.reg.AgentID,
+		"secret":   a.reg.Secret,
+		"pools":    pools,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.ServerURL+"/api/agent/heartbeat", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("heartbeat request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("heartbeat failed: HTTP %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (a *Agent) Run(ctx context.Context, collect func(ctx context.Context) ([]PoolSummary, error)) error {
+	var err error
+	a.reg, err = a.getOrRegister(ctx)
+	if err != nil {
+		return fmt.Errorf("agent registration: %w", err)
+	}
+
+	if a.cfg.Interval == 0 {
+		a.cfg.Interval = 60 * time.Second
+	}
+
+	a.logger.Info("agent running", "server", a.cfg.ServerURL, "interval", a.cfg.Interval)
+
+	ticker := time.NewTicker(a.cfg.Interval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case <-ticker.C:
-			if err := a.poll(ctx); err != nil {
-				slog.Error("poll failed", "err", err)
+			pools, err := collect(ctx)
+			if err != nil {
+				a.logger.Warn("collect pools failed", "err", err)
+				continue
+			}
+			if err := a.sendHeartbeat(ctx, pools); err != nil {
+				a.logger.Warn("heartbeat failed", "err", err)
+			} else {
+				a.logger.Debug("heartbeat sent", "pools", len(pools))
 			}
 		}
 	}
 }
 
-func (a *Agent) poll(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-
-	pools, err := a.metricsFunc(ctx)
-	if err != nil {
-		return fmt.Errorf("collect metrics: %w", err)
+func DefaultServerURL() string {
+	if u := os.Getenv("ZFSDASH_SERVER"); u != "" {
+		return u
 	}
-
-	hostname := a.hostname
-	if hostname == "" {
-		hostname, _ = os.Hostname()
-	}
-
-	payload := MetricsPayload{
-		HostID:    a.hostID,
-		Hostname:  hostname,
-		Timestamp: time.Now().Unix(),
-		Pools:     pools,
-		License:   a.licenseKey,
-		Agent: AgentInfo{
-			Version: a.version,
-			OS:      "linux",
-			Arch:    "amd64",
-			Uptime:  int64(time.Since(a.startTime).Seconds()),
-		},
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		a.cloudURL+"/api/agent/heartbeat", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.licenseKey)
-	req.Header.Set("User-Agent", "zfsdash-agent/"+a.version)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("send: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
-	}
-
-	var cmdResp CommandResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cmdResp); err != nil {
-		return nil // non-fatal
-	}
-
-	if cmdResp.NextPoll > 0 && cmdResp.NextPoll <= 3600 {
-		a.pollInterval = time.Duration(cmdResp.NextPoll) * time.Second
-	}
-
-	for _, cmd := range cmdResp.Commands {
-		if err := a.commandFunc(cmd); err != nil {
-			slog.Error("command failed", "id", cmd.ID, "action", cmd.Action, "err", err)
-		} else {
-			slog.Info("command executed", "id", cmd.ID, "action", cmd.Action)
-		}
-	}
-
-	return nil
+	return "https://app.zfsdash.com"
 }
