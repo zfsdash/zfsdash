@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZFSdash</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    :root{--bg:#0f1117;--card:#1a1d27;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#3b82f6;--green:#3fb950;--yellow:#f0ad4e;--red:#ff6b6b}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+    nav{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:56px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+    .nav-brand{font-size:18px;font-weight:700;color:var(--accent);display:flex;align-items:center;gap:8px}
+    .nav-brand svg{width:24px;height:24px}
+    .nav-right{display:flex;align-items:center;gap:16px}
+    .nav-host{font-size:13px;color:var(--muted);background:#0f1117;padding:4px 10px;border-radius:4px;border:1px solid var(--border)}
+    .btn{padding:6px 14px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.2s}
+    .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+    .btn-ghost:hover{color:var(--text);border-color:var(--accent)}
+    .btn-primary{background:var(--accent);color:#fff}
+    .btn-primary:hover{background:#2563eb}
+    main{padding:24px;max-width:1400px;margin:0 auto}
+    h2{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:12px}
+    .grid{display:grid;gap:16px}
+    .grid-3{grid-template-columns:repeat(3,1fr)}
+    .grid-2{grid-template-columns:repeat(2,1fr)}
+    @media(max-width:900px){.grid-3,.grid-2{grid-template-columns:1fr}}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px}
+    .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+    .card-title{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px}
+    .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+    .badge-green{background:rgba(63,185,80,0.15);color:var(--green)}
+    .badge-yellow{background:rgba(240,173,78,0.15);color:var(--yellow)}
+    .badge-red{background:rgba(255,107,107,0.15);color:var(--red)}
+    .pool-name{font-size:22px;font-weight:700;margin-bottom:4px}
+    .pool-meta{font-size:13px;color:var(--muted)}
+    .progress{height:6px;background:#0f1117;border-radius:3px;overflow:hidden;margin:12px 0 6px}
+    .progress-bar{height:100%;border-radius:3px;transition:width 0.5s ease}
+    .progress-bar.ok{background:var(--green)}
+    .progress-bar.warn{background:var(--yellow)}
+    .progress-bar.crit{background:var(--red)}
+    .progress-labels{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
+    .stat-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
+    .stat-row:last-child{border:none}
+    .stat-label{font-size:13px;color:var(--muted)}
+    .stat-value{font-size:13px;font-weight:600}
+    .arc-gauge{position:relative;width:120px;height:120px;margin:0 auto 16px}
+    .arc-gauge svg{transform:rotate(-90deg)}
+    .arc-gauge-label{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+    .arc-gauge-pct{font-size:24px;font-weight:700;color:var(--accent)}
+    .arc-gauge-sub{font-size:11px;color:var(--muted)}
+    .section{margin-bottom:32px}
+    .empty{text-align:center;padding:40px;color:var(--muted);font-size:14px}
+    .empty-icon{font-size:48px;margin-bottom:12px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;padding:8px 12px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border)}
+    td{padding:10px 12px;border-bottom:1px solid #1f2937}
+    tr:last-child td{border:none}
+    tr:hover td{background:rgba(59,130,246,0.04)}
+    .loading{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
+    .spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .alert{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:16px}
+    .alert-info{background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.3);color:#93c5fd}
+    #toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 20px;font-size:13px;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:999}
+    #toast.show{opacity:1}
+  </style>
+</head>
+<body>
+<nav>
+  <div class="nav-brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    ZFSdash
+  </div>
+  <div class="nav-right">
+    <span class="nav-host" id="nav-hostname">Loading...</span>
+    <button class="btn btn-ghost" onclick="logout()">Logout</button>
+  </div>
+</nav>
+<main>
+  <div id="setup-alert" class="alert alert-info" style="display:none">
+    ⚡ Setup complete. Add more hosts from <a href="/setup" style="color:var(--accent)">Settings</a>.
+  </div>
+
+  <!-- Pools -->
+  <div class="section">
+    <h2>Storage Pools</h2>
+    <div class="grid grid-3" id="pools-grid">
+      <div class="loading"><div class="spinner"></div> Loading pools...</div>
+    </div>
+  </div>
+
+  <!-- ARC + I/O -->
+  <div class="section">
+    <div class="grid grid-2">
+      <div>
+        <h2>ARC Cache</h2>
+        <div class="card" id="arc-card">
+          <div class="loading"><div class="spinner"></div> Loading ARC stats...</div>
+        </div>
+      </div>
+      <div>
+        <h2>Pool I/O</h2>
+        <div class="card" id="io-card">
+          <div class="loading"><div class="spinner"></div> Loading I/O stats...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Datasets -->
+  <div class="section">
+    <h2>Datasets</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>Name</th><th>Used</th><th>Available</th><th>Compression</th><th>Ratio</th></tr></thead>
+        <tbody id="datasets-body"><tr><td colspan="5"><div class="loading"><div class="spinner"></div> Loading...</div></td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Scrubs -->
+  <div class="section">
+    <h2>Recent Scrubs</h2>
+    <div class="card" id="scrubs-card">
+      <div class="loading"><div class="spinner"></div> Loading scrubs...</div>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const fmt = {
+  bytes(b) {
+    if (!b) return '0 B';
+    const u = ['B','KB','MB','GB','TB','PB'];
+    let i = 0;
+    while (b >= 1024 && i < u.length-1) { b/=1024; i++; }
+    return b.toFixed(i>0?1:0)+' '+u[i];
+  },
+  pct(v) { return (v||0).toFixed(1)+'%'; },
+  mbps(v) { return (v/1024/1024).toFixed(1)+' MB/s'; },
+  ops(v) { return (v||0).toFixed(0)+' ops/s'; }
+};
+
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 3000);
+}
+
+function logout() {
+  fetch('/api/auth/logout', {method:'POST'}).then(()=>location.href='/setup');
+}
+
+function statusBadge(state) {
+  const cls = state==='ONLINE'?'green':state==='DEGRADED'?'yellow':'red';
+  const dot = state==='ONLINE'?'●':state==='DEGRADED'?'▲':'✕';
+  return `<span class="badge badge-${cls}">${dot} ${state}</span>`;
+}
+
+async function loadPools() {
+  const grid = document.getElementById('pools-grid');
+  try {
+    const data = await api('/api/pools');
+    const pools = data.pools||[];
+    if (!pools.length) {
+      grid.innerHTML = '<div class="card empty"><div class="empty-icon">🗄️</div><p>No ZFS pools found.</p><p style="margin-top:8px;font-size:12px">Make sure ZFS is installed and pools are imported.</p></div>';
+      return;
+    }
+    grid.innerHTML = pools.map(p => {
+      const pct = p.capacity||0;
+      const barClass = pct>90?'crit':pct>75?'warn':'ok';
+      return `<div class="card">
+        <div class="card-header">
+          <div class="pool-name">${p.name}</div>
+          ${statusBadge(p.state||'ONLINE')}
+        </div>
+        <div class="pool-meta">${fmt.bytes(p.size)} total &middot; ${fmt.bytes(p.free)} free</div>
+        <div class="progress"><div class="progress-bar ${barClass}" style="width:${Math.min(pct,100)}%"></div></div>
+        <div class="progress-labels"><span>${fmt.pct(pct)} used</span><span>${fmt.bytes(p.allocated)} used</span></div>
+        <div style="margin-top:12px">
+          <div class="stat-row"><span class="stat-label">VDevs</span><span class="stat-value">${p.vdev_count||'-'}</span></div>
+          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value" style="color:var(--muted);font-size:12px">${p.status||'OK'}</span></div>
+        </div>
+      </div>`;
+    }).join('');
+    // load I/O for first pool
+    if (pools[0]) loadIO(pools[0].name);
+    loadDatasets(pools[0]?.name);
+  } catch(e) {
+    grid.innerHTML = `<div class="card empty"><div class="empty-icon">⚠️</div><p>${e.message}</p></div>`;
+  }
+}
+
+async function loadARC() {
+  const card = document.getElementById('arc-card');
+  try {
+    const a = await api('/api/arc');
+    if (!a.enabled) {
+      card.innerHTML = '<div class="empty">ARC stats not available on this platform.</div>';
+      return;
+    }
+    const pct = a.hit_ratio||0;
+    const r = 52;
+    const circ = 2*Math.PI*r;
+    const dash = circ*(pct/100);
+    card.innerHTML = `
+      <div class="arc-gauge">
+        <svg width="120" height="120" viewBox="0 0 120 120">
+          <circle cx="60" cy="60" r="${r}" stroke="#1f2937" stroke-width="8" fill="none"/>
+          <circle cx="60" cy="60" r="${r}" stroke="var(--accent)" stroke-width="8" fill="none"
+            stroke-dasharray="${dash} ${circ}" stroke-linecap="round"/>
+        </svg>
+        <div class="arc-gauge-label">
+          <div class="arc-gauge-pct">${pct.toFixed(0)}%</div>
+          <div class="arc-gauge-sub">hit ratio</div>
+        </div>
+      </div>
+      <div class="stat-row"><span class="stat-label">ARC Size</span><span class="stat-value">${fmt.bytes(a.size)}</span></div>
+      <div class="stat-row"><span class="stat-label">Max Size</span><span class="stat-value">${fmt.bytes(a.max_size)}</span></div>
+      <div class="stat-row"><span class="stat-label">Metadata</span><span class="stat-value">${fmt.bytes(a.metadata_size)}</span></div>
+      <div class="stat-row"><span class="stat-label">Efficiency</span><span class="stat-value">${fmt.pct(a.efficiency)}</span></div>
+      <div class="stat-row"><span class="stat-label">Hits</span><span class="stat-value">${(a.hits||0).toLocaleString()}</span></div>
+      <div class="stat-row"><span class="stat-label">Misses</span><span class="stat-value">${(a.misses||0).toLocaleString()}</span></div>`;
+  } catch(e) {
+    card.innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+}
+
+async function loadIO(poolName) {
+  const card = document.getElementById('io-card');
+  if (!poolName) { card.innerHTML='<div class="empty">No pools</div>'; return; }
+  try {
+    const d = await api(`/api/pools/${poolName}/iostat`);
+    card.innerHTML = `
+      <div class="card-header"><span class="card-title">${d.pool}</span></div>
+      <div class="stat-row"><span class="stat-label">Read</span><span class="stat-value" style="color:var(--green)">${fmt.mbps(d.read_bytes_per_sec)}</span></div>
+      <div class="stat-row"><span class="stat-label">Write</span><span class="stat-value" style="color:var(--accent)">${fmt.mbps(d.write_bytes_per_sec)}</span></div>
+      <div class="stat-row"><span class="stat-label">Read IOPS</span><span class="stat-value">${fmt.ops(d.read_ops_per_sec)}</span></div>
+      <div class="stat-row"><span class="stat-label">Write IOPS</span><span class="stat-value">${fmt.ops(d.write_ops_per_sec)}</span></div>`;
+  } catch(e) {
+    card.innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+}
+
+async function loadDatasets(poolName) {
+  const tbody = document.getElementById('datasets-body');
+  if (!poolName) { tbody.innerHTML='<tr><td colspan="5"><div class="empty">No pools</div></td></tr>'; return; }
+  try {
+    const d = await api(`/api/pools/${poolName}/datasets`);
+    const ds = d.datasets||[];
+    if (!ds.length) { tbody.innerHTML='<tr><td colspan="5"><div class="empty">No datasets</div></td></tr>'; return; }
+    tbody.innerHTML = ds.map(d=>`<tr>
+      <td style="font-family:monospace;font-size:12px">${d.name}</td>
+      <td>${fmt.bytes(d.used)}</td>
+      <td>${fmt.bytes(d.available)}</td>
+      <td>${d.compression||'-'}</td>
+      <td>${(d.ratio||1).toFixed(2)}x</td>
+    </tr>`).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="5">${e.message}</td></tr>`;
+  }
+}
+
+async function loadScrubs() {
+  const card = document.getElementById('scrubs-card');
+  try {
+    const d = await api('/api/scrubs');
+    const scrubs = d.scrubs||[];
+    if (!scrubs.length) {
+      card.innerHTML = '<div class="empty"><div class="empty-icon">🔍</div><p>No scrub history. Scrubs run automatically on a schedule.</p></div>';
+      return;
+    }
+    card.innerHTML = `<table><thead><tr><th>Pool</th><th>State</th><th>Duration</th><th>Scanned</th><th>Issues</th><th>Repaired</th></tr></thead><tbody>${
+      scrubs.map(s=>{
+        const dur = s.duration_sec ? Math.round(s.duration_sec/60)+'m' : '-';
+        return `<tr>
+          <td>${s.pool}</td>
+          <td>${statusBadge(s.state)}</td>
+          <td>${dur}</td>
+          <td>${fmt.bytes(s.bytes_scanned)}</td>
+          <td style="color:${s.bytes_issues?'var(--yellow)':'var(--muted)'}">${fmt.bytes(s.bytes_issues)||'None'}</td>
+          <td>${fmt.bytes(s.bytes_repaired)||'-'}</td>
+        </tr>`;
+      }).join('')
+    }</tbody></table>`;
+  } catch(e) {
+    card.innerHTML = `<div class="empty">${e.message}</div>`;
+  }
+}
+
+async function loadHostname() {
+  try {
+    const d = await api('/api/host-info');
+    document.getElementById('nav-hostname').textContent = d.hostname||'localhost';
+    document.title = `ZFSdash — ${d.hostname}`;
+  } catch { document.getElementById('nav-hostname').textContent = 'localhost'; }
+}
+
+// Init
+loadHostname();
+loadPools();
+loadARC();
+loadScrubs();
+
+// Auto-refresh every 30s
+setInterval(()=>{ loadPools(); loadARC(); }, 30000);
+</script>
+</body>
+</html>
