@@ -105,6 +105,15 @@ func RegisterRoutes(
 			r.Get("/pools/{pool}/history", h.handlePoolHistory)
 			r.Get("/pools/{pool}/scrub-history", h.handleScrubHistory)
 			r.Get("/smart", h.handleSMARTData)
+
+			// Replication & drive replacement
+			r.Get("/api/replication/jobs", h.handleListReplicationJobs)
+			r.Post("/api/replication/jobs", h.handleCreateReplicationJob)
+			r.Get("/api/replication/jobs/{id}/status", h.handleReplicationJobStatus)
+			r.Post("/api/replication/jobs/{id}/run", h.handleRunReplicationJob)
+			r.Get("/api/pools/{pool}/vdevs", h.handleGetPoolVDevs)
+			r.Post("/api/pools/{pool}/replace", h.handleReplaceVDev)
+			r.Get("/api/pools/{pool}/resilver/status", h.handleResiverStatus)
 		})
 	})
 }

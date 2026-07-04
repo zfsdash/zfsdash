@@ -1,202 +1,174 @@
 package zfs
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
 )
 
-// ReplicationJob describes a send/receive task.
+// ReplicationJob represents a configured ZFS send/receive replication job.
 type ReplicationJob struct {
-	ID          string    `json:"id"`
-	Source      string    `json:"source"`       // e.g. tank/data@snap1
-	Target      string    `json:"target"`       // e.g. tank/data (on remote or local)
-	RemoteHost  string    `json:"remote_host"`  // empty = local
-	RemoteUser  string    `json:"remote_user"`  // default: root
-	Incremental bool      `json:"incremental"`
-	FromSnap    string    `json:"from_snap"`    // for incremental: previous snapshot
-	Recursive   bool      `json:"recursive"`
-	DryRun      bool      `json:"dry_run"`
-	Status      string    `json:"status"`       // pending, running, done, error
-	BytesEst    int64     `json:"bytes_est"`
-	BytesSent   int64     `json:"bytes_sent"`
-	Started     time.Time `json:"started"`
-	Finished    time.Time `json:"finished"`
-	Error       string    `json:"error,omitempty"`
-	Log         []string  `json:"log"`
+	ID              string     `json:"id"`
+	SourcePool      string     `json:"source_pool"`
+	SourceDataset   string     `json:"source_dataset"`
+	DestinationHost string     `json:"destination_host"`
+	DestinationPool string     `json:"destination_pool"`
+	IntervalSeconds int        `json:"interval_seconds"`
+	Compression     string     `json:"compression"`
+	Incremental     bool       `json:"incremental"`
+	LastRun         *time.Time `json:"last_run"`
+	LastSuccess     *time.Time `json:"last_success"`
+	LastError       string     `json:"last_error"`
+	Enabled         bool       `json:"enabled"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
-// EstimateReplication returns byte count for a send without actually sending.
-func EstimateReplication(source, fromSnap string, recursive bool) (int64, error) {
-	args := []string{"send", "-n", "-P"}
-	if recursive {
-		args = append(args, "-R")
-	}
-	if fromSnap != "" {
-		args = append(args, "-i", fromSnap)
-	}
-	args = append(args, source)
-
-	out, err := exec.Command("zfs", args...).CombinedOutput()
-	if err != nil {
-		return 0, fmt.Errorf("zfs send -n: %w — %s", err, strings.TrimSpace(string(out)))
-	}
-
-	// Parse "size\t<bytes>" line from -P output
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "size") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				var n int64
-				fmt.Sscanf(parts[1], "%d", &n)
-				return n, nil
-			}
-		}
-	}
-	return 0, nil
+// ReplicationStatus is the runtime status of a replication job.
+type ReplicationStatus struct {
+	JobID     string     `json:"job_id"`
+	Running   bool       `json:"running"`
+	StartedAt *time.Time `json:"started_at"`
+	BytesSent int64      `json:"bytes_sent"`
+	Error     string     `json:"error"`
+	Snapshot  string     `json:"snapshot"`
 }
 
-// RunReplication executes a zfs send | zfs recv pipeline.
-// Progress lines are written to progressCh. Close ctx to cancel.
-func RunReplication(ctx context.Context, job *ReplicationJob, progressCh chan<- string) error {
-	job.Status = "running"
-	job.Started = time.Now()
+// VDev is a device in a ZFS pool vdev tree.
+type VDev struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	State    string `json:"state"`
+	Errors   uint64 `json:"errors"`
+	Children []VDev `json:"children,omitempty"`
+}
 
-	// Build send args
-	sendArgs := []string{"send", "-P"}
-	if job.Recursive {
-		sendArgs = append(sendArgs, "-R")
-	}
-	if job.DryRun {
-		sendArgs = append(sendArgs, "-n")
-	}
-	if job.Incremental && job.FromSnap != "" {
-		sendArgs = append(sendArgs, "-i", job.FromSnap)
-	}
-	sendArgs = append(sendArgs, job.Source)
+// PoolVDevTree is the full vdev topology of a pool.
+type PoolVDevTree struct {
+	PoolName string `json:"pool_name"`
+	VDevs    []VDev `json:"vdevs"`
+}
 
-	// Build recv args
-	var recvCmd *exec.Cmd
-	recvArgs := []string{"recv", "-u"}
-	if job.Incremental {
-		recvArgs = append(recvArgs, "-F")
-	}
-	recvArgs = append(recvArgs, job.Target)
+// ResiverStatus holds resilver progress for a pool.
+type ResiverStatus struct {
+	PoolName    string  `json:"pool_name"`
+	Resilvering bool    `json:"resilvering"`
+	Progress    float64 `json:"progress"`
+	BytesDone   uint64  `json:"bytes_done"`
+	BytesTotal  uint64  `json:"bytes_total"`
+}
 
-	if job.RemoteHost != "" {
-		user := job.RemoteUser
-		if user == "" {
-			user = "root"
-		}
-		sshArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-			user + "@" + job.RemoteHost, "zfs"}
-		sshArgs = append(sshArgs, recvArgs...)
-		recvCmd = exec.CommandContext(ctx, "ssh", sshArgs...)
-	} else {
-		recvCmd = exec.CommandContext(ctx, "zfs", recvArgs...)
-	}
-
-	sendCmd := exec.CommandContext(ctx, "zfs", sendArgs...)
-
-	// Wire send stdout → recv stdin
-	pipe, err := sendCmd.StdoutPipe()
+// GetPoolVDevTree returns the vdev topology for a pool.
+func GetPoolVDevTree(ctx context.Context, poolName string) (*PoolVDevTree, error) {
+	cmd := exec.CommandContext(ctx, "zpool", "status", "-L", poolName)
+	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+		return nil, fmt.Errorf("zpool status: %w", err)
 	}
-	recvCmd.Stdin = pipe
-
-	// Capture send stderr for progress
-	sendErrPipe, _ := sendCmd.StderrPipe()
-	recvErrPipe, _ := recvCmd.StderrPipe()
-
-	if err := sendCmd.Start(); err != nil {
-		return fmt.Errorf("zfs send start: %w", err)
+	tree := &PoolVDevTree{
+		PoolName: poolName,
+		VDevs:    parseVDevLines(string(out)),
 	}
-	if err := recvCmd.Start(); err != nil {
-		sendCmd.Process.Kill()
-		return fmt.Errorf("zfs recv start: %w", err)
-	}
+	return tree, nil
+}
 
-	// Stream progress from send stderr
-	go func() {
-		scanner := bufio.NewScanner(io.MultiReader(sendErrPipe, recvErrPipe))
-		for scanner.Scan() {
-			line := scanner.Text()
-			job.Log = append(job.Log, line)
-			if progressCh != nil {
-				select {
-				case progressCh <- line:
-				default:
-				}
-			}
+func parseVDevLines(output string) []VDev {
+	var vdevs []VDev
+	lines := strings.Split(output, "\n")
+	inConfig := false
+	for _, line := range lines {
+		if strings.Contains(line, "config:") {
+			inConfig = true
+			continue
 		}
-	}()
-
-	if err := sendCmd.Wait(); err != nil {
-		recvCmd.Process.Kill()
-		job.Status = "error"
-		job.Error = fmt.Sprintf("zfs send: %v", err)
-		job.Finished = time.Now()
-		return fmt.Errorf("zfs send: %w", err)
+		if !inConfig {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "NAME") || strings.HasPrefix(trimmed, "errors:") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		state := fields[1]
+		switch state {
+		case "ONLINE", "DEGRADED", "FAULTED", "OFFLINE", "UNAVAIL", "REMOVED":
+			vdevs = append(vdevs, VDev{
+				Name:  name,
+				Path:  "/dev/" + name,
+				State: state,
+			})
+		}
 	}
+	return vdevs
+}
 
-	if err := recvCmd.Wait(); err != nil {
-		job.Status = "error"
-		job.Error = fmt.Sprintf("zfs recv: %v", err)
-		job.Finished = time.Now()
-		return fmt.Errorf("zfs recv: %w", err)
+// ReplaceVDev runs zpool replace to substitute a failed device.
+func ReplaceVDev(ctx context.Context, pool, oldDev, newDev string) error {
+	cmd := exec.CommandContext(ctx, "zpool", "replace", pool, oldDev, newDev)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("zpool replace: %s: %w", strings.TrimSpace(string(out)), err)
 	}
-
-	job.Status = "done"
-	job.Finished = time.Now()
-	slog.Info("replication complete", "source", job.Source, "target", job.Target,
-		"duration", job.Finished.Sub(job.Started).Round(time.Second))
 	return nil
 }
 
-// ListSnapshots returns snapshots for a dataset, sorted oldest→newest.
-func ListSnapshotsForDataset(dataset string) ([]string, error) {
-	out, err := exec.Command("zfs", "list", "-H", "-t", "snapshot",
-		"-o", "name", "-s", "creation", "-r", dataset).Output()
+// GetResiverStatus returns live resilver progress for a pool.
+func GetResiverStatus(ctx context.Context, poolName string) (*ResiverStatus, error) {
+	cmd := exec.CommandContext(ctx, "zpool", "status", poolName)
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("zfs list snapshots: %w", err)
+		return nil, fmt.Errorf("zpool status: %w", err)
 	}
-	var snaps []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line != "" {
-			snaps = append(snaps, line)
+	status := &ResiverStatus{PoolName: poolName}
+	for _, line := range strings.Split(string(out), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.Contains(t, "resilver in progress") {
+			status.Resilvering = true
+		}
+		if strings.Contains(t, "% complete") {
+			var pct float64
+			fmt.Sscanf(t, "%f%% complete", &pct)
+			status.Progress = pct
 		}
 	}
-	return snaps, nil
+	return status, nil
 }
 
-// LatestSharedSnapshot finds the most recent snapshot present on both source dataset
-// and listed in targetSnaps (fetched separately from remote).
-func LatestSharedSnapshot(sourceDataset string, targetSnaps []string) (string, error) {
-	sourceSnaps, err := ListSnapshotsForDataset(sourceDataset)
+// SendReceive performs zfs send | zfs receive for a replication job.
+func SendReceive(ctx context.Context, job *ReplicationJob, snapshot string) error {
+	sendArgs := []string{"send"}
+	if job.Incremental {
+		sendArgs = append(sendArgs, "-i", job.SourceDataset+"@prev")
+	}
+	sendArgs = append(sendArgs, job.SourceDataset+"@"+snapshot)
+
+	send := exec.CommandContext(ctx, "zfs", sendArgs...)
+	var recv *exec.Cmd
+	if job.DestinationHost != "" {
+		recv = exec.CommandContext(ctx, "ssh", job.DestinationHost,
+			"zfs receive -F "+job.DestinationPool)
+	} else {
+		recv = exec.CommandContext(ctx, "zfs", "receive", "-F", job.DestinationPool)
+	}
+
+	pipe, err := send.StdoutPipe()
 	if err != nil {
-		return "", err
+		return err
 	}
-	targetSet := make(map[string]bool, len(targetSnaps))
-	for _, s := range targetSnaps {
-		parts := strings.SplitN(s, "@", 2)
-		if len(parts) == 2 {
-			targetSet[parts[1]] = true
-		}
+	recv.Stdin = pipe
+	if err := send.Start(); err != nil {
+		return fmt.Errorf("send start: %w", err)
 	}
-	// Walk source newest→oldest
-	for i := len(sourceSnaps) - 1; i >= 0; i-- {
-		parts := strings.SplitN(sourceSnaps[i], "@", 2)
-		if len(parts) == 2 && targetSet[parts[1]] {
-			return sourceSnaps[i], nil
-		}
+	if err := recv.Start(); err != nil {
+		return fmt.Errorf("recv start: %w", err)
 	}
-	return "", nil // no shared snapshot → full send needed
+	if err := send.Wait(); err != nil {
+		return fmt.Errorf("send: %w", err)
+	}
+	return recv.Wait()
 }

@@ -68,7 +68,7 @@ func (h *PoolHealth) parse(raw string) {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// Overall pool state
+		// Overall h.Pool state
 		if strings.HasPrefix(trimmed, "state:") {
 			state := strings.TrimSpace(strings.TrimPrefix(trimmed, "state:"))
 			h.Status = PoolStatus(state)
