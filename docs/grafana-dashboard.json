@@ -1,0 +1,170 @@
+{
+  "title": "ZFSdash",
+  "uid": "zfsdash-v1",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "30s",
+  "tags": ["zfs", "zfsdash", "storage"],
+  "annotations": {"list": []},
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Pool Health Status",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "ONLINE", "color": "green"}, "1": {"text": "DEGRADED", "color": "yellow"}, "2": {"text": "FAULTED", "color": "red"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}]},
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "auto", "textMode": "auto", "colorMode": "background"},
+      "targets": [{"expr": "zfsdash_pool_health{job=\"zfsdash\"}", "legendFormat": "{{pool}}", "refId": "A"}]
+    },
+    {
+      "id": 2,
+      "title": "Pool Capacity Used %",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "red", "value": 85}]},
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "showThresholdLabels": false, "showThresholdMarkers": true},
+      "targets": [{"expr": "100 * zfsdash_pool_used_bytes{job=\"zfsdash\"} / zfsdash_pool_size_bytes{job=\"zfsdash\"}", "legendFormat": "{{pool}}", "refId": "A"}]
+    },
+    {
+      "id": 3,
+      "title": "ARC Hit Ratio",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "green", "value": 0.9}]},
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "showThresholdLabels": false, "showThresholdMarkers": true},
+      "targets": [{"expr": "zfsdash_arc_hit_ratio{job=\"zfsdash\"}", "legendFormat": "{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 4,
+      "title": "ARC Size",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "targets": [{"expr": "zfsdash_arc_size_bytes{job=\"zfsdash\"}", "legendFormat": "ARC Size", "refId": "A"}]
+    },
+    {
+      "id": 5,
+      "title": "Pool Fragmentation %",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent", "min": 0, "max": 100,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 80}]},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never"}
+        }
+      },
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "zfsdash_pool_fragmentation{job=\"zfsdash\"}", "legendFormat": "{{pool}}", "refId": "A"}]
+    },
+    {
+      "id": 6,
+      "title": "Pool Size vs Used",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never"}
+        }
+      },
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "zfsdash_pool_size_bytes{job=\"zfsdash\"}", "legendFormat": "{{pool}} total", "refId": "A"},
+        {"expr": "zfsdash_pool_used_bytes{job=\"zfsdash\"}", "legendFormat": "{{pool}} used", "refId": "B"}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Scrub Errors Total",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "color": {"mode": "thresholds"},
+          "mappings": [{"type": "value", "options": {"0": {"text": "No errors", "color": "green"}}}]
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "targets": [{"expr": "zfsdash_scrub_errors_total{job=\"zfsdash\"}", "legendFormat": "{{pool}}", "refId": "A"}]
+    },
+    {
+      "id": 8,
+      "title": "ARC Hit Ratio Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 18, "x": 6, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit", "min": 0, "max": 1,
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never", "gradientMode": "opacity"}
+        }
+      },
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "zfsdash_arc_hit_ratio{job=\"zfsdash\"}", "legendFormat": "{{instance}} ARC hit ratio", "refId": "A"}]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(zfsdash_pool_health, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "pool",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(zfsdash_pool_health{instance=~\"$instance\"}, pool)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser"
+}
