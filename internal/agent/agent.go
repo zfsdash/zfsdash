@@ -20,152 +20,69 @@ type Config struct {
 
 type PoolSummary struct {
 	Name      string  `json:"name"`
+	Health    string  `json:"health"`
 	Size      uint64  `json:"size"`
 	Used      uint64  `json:"used"`
 	Free      uint64  `json:"free"`
-	Health    string  `json:"health"`
 	UsedPct   float64 `json:"used_pct"`
 	Timestamp int64   `json:"timestamp"`
-}
-
-type Collector interface {
-	GetPools(ctx context.Context) ([]PoolSummary, error)
-}
-
-type Registration struct {
-	AgentID string `json:"agent_id"`
-	Secret  string `json:"secret"`
 }
 
 type Agent struct {
 	cfg    Config
 	db     *sql.DB
-	reg    *Registration
+	reg    struct{ AgentID, Secret string }
 	client *http.Client
-	logger *slog.Logger
 }
 
 func New(cfg Config, db *sql.DB) *Agent {
-	return &Agent{
-		cfg:    cfg,
-		db:     db,
-		client: &http.Client{Timeout: 15 * time.Second},
-		logger: slog.Default(),
-	}
+	return &Agent{cfg: cfg, db: db, client: &http.Client{Timeout: 15 * time.Second}}
 }
 
-func (a *Agent) initSchema() error {
-	_, err := a.db.Exec(`CREATE TABLE IF NOT EXISTS agent_registration (
-		agent_id TEXT NOT NULL,
-		secret TEXT NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	)`)
-	return err
+func (a *Agent) initSchema() {
+	a.db.Exec(`CREATE TABLE IF NOT EXISTS agent_registration (agent_id TEXT, secret TEXT)`)
 }
 
-func (a *Agent) getOrRegister(ctx context.Context) (*Registration, error) {
-	if err := a.initSchema(); err != nil {
-		return nil, fmt.Errorf("init schema: %w", err)
-	}
-
-	var reg Registration
-	err := a.db.QueryRowContext(ctx, "SELECT agent_id, secret FROM agent_registration LIMIT 1").
-		Scan(&reg.AgentID, &reg.Secret)
-	if err == nil {
-		return &reg, nil
-	}
-
-	// Register with server
+func (a *Agent) getOrRegister(ctx context.Context) error {
+	a.initSchema()
+	err := a.db.QueryRowContext(ctx, "SELECT agent_id, secret FROM agent_registration LIMIT 1").Scan(&a.reg.AgentID, &a.reg.Secret)
+	if err == nil { return nil }
 	body, _ := json.Marshal(map[string]string{"token": a.cfg.Token})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.ServerURL+"/api/agent/register", bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", a.cfg.ServerURL+"/api/agent/register", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("register request: %w", err)
-	}
+	if err != nil { return fmt.Errorf("register: %w", err) }
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("register failed: HTTP %d", resp.StatusCode)
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
-		return nil, fmt.Errorf("decode register response: %w", err)
-	}
-
-	_, err = a.db.ExecContext(ctx, "INSERT INTO agent_registration (agent_id, secret) VALUES (?, ?)",
-		reg.AgentID, reg.Secret)
-	if err != nil {
-		return nil, fmt.Errorf("save registration: %w", err)
-	}
-
-	a.logger.Info("agent registered", "agent_id", reg.AgentID)
-	return &reg, nil
-}
-
-func (a *Agent) sendHeartbeat(ctx context.Context, pools []PoolSummary) error {
-	payload := map[string]interface{}{
-		"agent_id": a.reg.AgentID,
-		"secret":   a.reg.Secret,
-		"pools":    pools,
-	}
-	body, _ := json.Marshal(payload)
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.ServerURL+"/api/agent/heartbeat", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("heartbeat request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("heartbeat failed: HTTP %d", resp.StatusCode)
-	}
-
+	if err := json.NewDecoder(resp.Body).Decode(&a.reg); err != nil { return fmt.Errorf("decode register: %w", err) }
+	a.db.ExecContext(ctx, "INSERT INTO agent_registration VALUES (?,?)", a.reg.AgentID, a.reg.Secret)
+	slog.Info("agent registered", "id", a.reg.AgentID)
 	return nil
 }
 
-func (a *Agent) Run(ctx context.Context, collect func(ctx context.Context) ([]PoolSummary, error)) error {
-	var err error
-	a.reg, err = a.getOrRegister(ctx)
-	if err != nil {
-		return fmt.Errorf("agent registration: %w", err)
-	}
-
-	if a.cfg.Interval == 0 {
-		a.cfg.Interval = 60 * time.Second
-	}
-
-	a.logger.Info("agent running", "server", a.cfg.ServerURL, "interval", a.cfg.Interval)
-
-	ticker := time.NewTicker(a.cfg.Interval)
-	defer ticker.Stop()
-
+func (a *Agent) Run(ctx context.Context, collect func(context.Context) ([]PoolSummary, error)) error {
+	if err := a.getOrRegister(ctx); err != nil { return err }
+	if a.cfg.Interval == 0 { a.cfg.Interval = 60 * time.Second }
+	slog.Info("agent running", "server", a.cfg.ServerURL, "interval", a.cfg.Interval)
+	tick := time.NewTicker(a.cfg.Interval)
+	defer tick.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
+		case <-ctx.Done(): return nil
+		case <-tick.C:
 			pools, err := collect(ctx)
-			if err != nil {
-				a.logger.Warn("collect pools failed", "err", err)
-				continue
-			}
-			if err := a.sendHeartbeat(ctx, pools); err != nil {
-				a.logger.Warn("heartbeat failed", "err", err)
-			} else {
-				a.logger.Debug("heartbeat sent", "pools", len(pools))
-			}
+			if err != nil { slog.Warn("collect failed", "err", err); continue }
+			body, _ := json.Marshal(map[string]any{"agent_id": a.reg.AgentID, "secret": a.reg.Secret, "pools": pools})
+			req, _ := http.NewRequestWithContext(ctx, "POST", a.cfg.ServerURL+"/api/agent/heartbeat", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := a.client.Do(req)
+			if err != nil { slog.Warn("heartbeat failed", "err", err); continue }
+			resp.Body.Close()
+			slog.Debug("heartbeat sent", "pools", len(pools))
 		}
 	}
 }
 
 func DefaultServerURL() string {
-	if u := os.Getenv("ZFSDASH_SERVER"); u != "" {
-		return u
-	}
+	if u := os.Getenv("ZFSDASH_SERVER"); u != "" { return u }
 	return "https://app.zfsdash.com"
 }
