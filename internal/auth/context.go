@@ -1,16 +1,22 @@
 package auth
 
-import "context"
+import (
+	"context"
+
+	"github.com/zfsdash/zfsdash/internal/db"
+)
 
 type contextKey string
 
-const userContextKey contextKey = "user"
+const sessionKey contextKey = "session"
 
-func contextWithUser(ctx context.Context, u *User) context.Context {
-	return context.WithValue(ctx, userContextKey, u)
+// WithSession stores a session in the context.
+func WithSession(ctx context.Context, session *db.Session) context.Context {
+	return context.WithValue(ctx, sessionKey, session)
 }
 
-func UserFromContext(ctx context.Context) *User {
-	u, _ := ctx.Value(userContextKey).(*User)
-	return u
+// SessionFromContext retrieves a session from the context.
+func SessionFromContext(ctx context.Context) (*db.Session, bool) {
+	session, ok := ctx.Value(sessionKey).(*db.Session)
+	return session, ok
 }
