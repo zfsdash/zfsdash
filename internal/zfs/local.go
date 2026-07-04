@@ -270,7 +270,8 @@ func parseScrubStatus(output []byte) *Scrub {
 			} else {
 				parts := strings.Fields(line)
 				if len(parts) >= 2 {
-					scrub.Errors, _ = strconv.Atoi(parts[1])
+					n, _ := strconv.Atoi(parts[1])
+					scrub.Errors = uint64(n)
 				}
 			}
 		}
