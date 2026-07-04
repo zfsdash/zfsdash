@@ -1,0 +1,48 @@
+project_name: zfsdash
+
+builds:
+  - id: zfsdash
+    main: .
+    binary: zfsdash
+    goos:
+      - linux
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/zfsdash/zfsdash/internal/version.Version={{.Version}}
+      - -X github.com/zfsdash/zfsdash/internal/version.Commit={{.Commit}}
+
+archives:
+  - format: tar.gz
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE
+      - README.md
+      - config.example.yaml
+      - zfsdash.service
+      - zfsdash.rc
+      - install.sh
+
+checksum:
+  name_template: 'checksums.txt'
+
+release:
+  draft: false
+  prerelease: auto
+  header: |
+    ## ZFSdash {{ .Version }}
+
+    Single-binary ZFS management dashboard for Linux and FreeBSD.
+
+    ### Install
+    ```bash
+    curl -fsSL https://zfsdash.com/install.sh | sudo bash
+    ```
+
+    ### Manual install
+    Download the binary for your platform below, make it executable, and move it to `/usr/local/bin/zfsdash`.
