@@ -1,167 +1,199 @@
-// Package auth implements user authentication and session management for ZFSdash.
-//
-// Session tokens are 32 random bytes encoded as a 64-character hex string.
-// Only the SHA256 hash of the token is stored in the database; the plaintext
-// token is returned to the caller once and never persisted.
-//
-// Passwords are hashed with bcrypt at cost 12.
 package auth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
-	"fmt"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/zfsdash/zfsdash/internal/db"
 	"golang.org/x/crypto/bcrypt"
 )
 
-const (
-	sessionDuration = 7 * 24 * time.Hour
-	bcryptCost      = 12
+var (
+	ErrInvalidCredentials = errors.New("invalid email or password")
+	ErrSessionNotFound    = errors.New("session not found or expired")
+	ErrUserExists         = errors.New("user already exists")
 )
 
-// Service handles authentication and session lifecycle.
-type Service struct {
-	store *db.Store
+type User struct {
+	ID        int64     `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// New creates a new auth Service backed by the given store.
-func New(store *db.Store) *Service {
-	return &Service{store: store}
+type Manager struct {
+	db *sql.DB
 }
 
-// --- Password helpers ---
-
-// HashPassword returns a bcrypt hash of password using cost 12.
-func HashPassword(password string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
-	if err != nil {
-		return "", fmt.Errorf("hash password: %w", err)
+func NewManager(db *sql.DB) *Manager {
+	if err := initSchema(db); err != nil {
+		panic(err)
 	}
-	return string(hash), nil
+	return &Manager{db: db}
 }
 
-// CheckPassword verifies password against a bcrypt hash.
-func CheckPassword(hash, password string) bool {
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+func initSchema(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			email TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			token TEXT NOT NULL UNIQUE,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		);
+	`)
+	return err
 }
 
-// --- Token helpers ---
-
-// generateToken creates a cryptographically random 64-char hex token.
-func generateToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("rand.Read: %w", err)
-	}
-	return hex.EncodeToString(b), nil
-}
-
-// hashToken returns the hex-encoded SHA256 of token for database storage.
-// The plaintext token is never stored; only this hash is persisted.
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-// --- User management ---
-
-// CreateAdminUser creates the initial admin account. Returns an error if a user
-// with the same username already exists.
-func (s *Service) CreateAdminUser(username, email, password string) error {
-	hash, err := HashPassword(password)
-	if err != nil {
-		return err
-	}
-	return s.store.CreateUser(uuid.New().String(), username, email, hash, true)
-}
-
-// CreateUser creates a non-admin user account.
-func (s *Service) CreateUser(username, email, password string) error {
-	hash, err := HashPassword(password)
-	if err != nil {
-		return err
-	}
-	return s.store.CreateUser(uuid.New().String(), username, email, hash, false)
-}
-
-// ListUsers returns all users in the database.
-func (s *Service) ListUsers() ([]*db.User, error) {
-	return s.store.ListUsers()
-}
-
-// DeleteUser removes the user with the given ID.
-func (s *Service) DeleteUser(id string) error {
-	return s.store.DeleteUser(id)
-}
-
-// --- Session management ---
-
-// Login verifies username/password credentials and returns a plaintext session
-// token on success. The token must be sent to the client as a cookie; its
-// SHA256 hash is what is stored in the database.
-func (s *Service) Login(username, password string) (string, error) {
-	user, err := s.store.GetUserByUsername(username)
-	if err != nil {
-		return "", fmt.Errorf("lookup user: %w", err)
-	}
-	if user == nil || !user.IsActive {
-		return "", fmt.Errorf("invalid credentials")
-	}
-	if !CheckPassword(user.PasswordHash, password) {
-		return "", fmt.Errorf("invalid credentials")
-	}
-
-	token, err := generateToken()
-	if err != nil {
-		return "", fmt.Errorf("generate token: %w", err)
-	}
-
-	tokenHash := hashToken(token)
-	expiresAt := time.Now().Add(sessionDuration)
-
-	if err := s.store.CreateSessionByHash(uuid.New().String(), user.ID, tokenHash, expiresAt); err != nil {
-		return "", fmt.Errorf("create session: %w", err)
-	}
-
-	if err := s.store.TouchLastLogin(user.ID); err != nil {
-		// Non-fatal: login succeeded even if we can't update last_login_at.
-		fmt.Printf("[auth] touch last_login_at: %v\n", err)
-	}
-
-	return token, nil
-}
-
-// ValidateSession looks up the session for the given plaintext token and
-// returns the associated user. Returns (nil, nil) for an unknown or expired
-// token — the caller should treat this as "not authenticated".
-func (s *Service) ValidateSession(token string) (*db.User, error) {
-	if token == "" {
-		return nil, nil
-	}
-	tokenHash := hashToken(token)
-	sess, err := s.store.GetSessionByHash(tokenHash)
+func (m *Manager) CreateUser(email, password string) (*User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, err
 	}
-	if sess == nil {
-		return nil, nil
+	res, err := m.db.Exec(`INSERT INTO users (email, password_hash) VALUES (?, ?)`, email, string(hash))
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return nil, ErrUserExists
+		}
+		return nil, err
 	}
-	// Slide the last_activity_at timestamp.
-	_ = s.store.TouchSessionActivity(sess.ID)
-
-	return s.store.GetUserByID(sess.UserID)
+	id, _ := res.LastInsertId()
+	return &User{ID: id, Email: email, CreatedAt: time.Now()}, nil
 }
 
-// Logout deletes the session identified by the plaintext token.
-func (s *Service) Logout(token string) error {
-	if token == "" {
-		return nil
+func (m *Manager) Login(email, password string) (string, error) {
+	var id int64
+	var hash string
+	err := m.db.QueryRow(`SELECT id, password_hash FROM users WHERE email = ?`, email).Scan(&id, &hash)
+	if err == sql.ErrNoRows {
+		return "", ErrInvalidCredentials
 	}
-	tokenHash := hashToken(token)
-	return s.store.DeleteSessionByHash(tokenHash)
+	if err != nil {
+		return "", err
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+		return "", ErrInvalidCredentials
+	}
+	tokenBytes := make([]byte, 32)
+	rand.Read(tokenBytes)
+	token := hex.EncodeToString(tokenBytes)
+	expires := time.Now().Add(7 * 24 * time.Hour)
+	_, err = m.db.Exec(`INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)`, id, token, expires)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (m *Manager) ValidateSession(token string) (*User, error) {
+	var u User
+	var expiresAt time.Time
+	err := m.db.QueryRow(`
+		SELECT u.id, u.email, u.created_at, s.expires_at
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token = ?
+	`, token).Scan(&u.ID, &u.Email, &u.CreatedAt, &expiresAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if time.Now().After(expiresAt) {
+		m.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+		return nil, ErrSessionNotFound
+	}
+	return &u, nil
+}
+
+func (m *Manager) Logout(token string) error {
+	_, err := m.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+	return err
+}
+
+func (m *Manager) UserCount() (int, error) {
+	var count int
+	err := m.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
+}
+
+// Middleware extracts session token from cookie or Authorization header
+func (m *Manager) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := ""
+		if c, err := r.Cookie("zfsdash_session"); err == nil {
+			token = c.Value
+		} else if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token = strings.TrimPrefix(auth, "Bearer ")
+		}
+		if token == "" {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		user, err := m.ValidateSession(token)
+		if err != nil {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		r = r.WithContext(contextWithUser(r.Context(), user))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (m *Manager) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+	token, err := m.Login(req.Email, req.Password)
+	if err != nil {
+		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "zfsdash_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   7 * 24 * 3600,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"token": token})
+}
+
+func (m *Manager) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie("zfsdash_session"); err == nil {
+		m.Logout(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: "zfsdash_session", MaxAge: -1, Path: "/"})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func (m *Manager) HandleMe(w http.ResponseWriter, r *http.Request) {
+	user := UserFromContext(r.Context())
+	if user == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"user":null}`))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"user": user})
 }
