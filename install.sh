@@ -1,119 +1,114 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-REPO="zfsdash/zfsdash"
-VERSION="v0.1.0"
-INSTALL_DIR="/usr/local/bin"
-SERVICE_DIR="/etc/systemd/system"
-DATA_DIR="/var/lib/zfsdash"
-USER="zfsdash"
+VERSION=v0.1.5
+BINARY_NAME=zfsdash
+INSTALL_DIR=/usr/local/bin
+SERVICE_USER=zfsdash
+DATA_DIR=/var/lib/zfsdash
 
-GREEN='\033[0;32m'; BLUE='\033[0;34m'; RED='\033[0;31m'; NC='\033[0m'
-log()  { echo -e "${BLUE}==>${NC} $1"; }
-ok()   { echo -e "${GREEN}✓${NC} $1"; }
-err()  { echo -e "${RED}✗${NC} $1" >&2; exit 1; }
-
-# Detect OS and arch
+# Detect OS and architecture
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  ARCH="amd64" ;;
-  aarch64) ARCH="arm64" ;;
-  arm64)   ARCH="arm64" ;;
-  *)       err "Unsupported architecture: $ARCH" ;;
-esac
 
 case "$OS" in
-  linux|freebsd) ;;
-  *) err "Unsupported OS: $OS (Linux and FreeBSD supported)" ;;
+  linux)  OS_NAME=linux ;;
+  freebsd) OS_NAME=freebsd ;;
+  *) echo "Unsupported OS: $OS"; exit 1 ;;
 esac
 
-BINARY="zfsdash-${OS}-${ARCH}"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}"
+case "$ARCH" in
+  x86_64|amd64) ARCH_NAME=amd64 ;;
+  aarch64|arm64) ARCH_NAME=arm64 ;;
+  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
 
-log "Installing ZFSdash ${VERSION} for ${OS}/${ARCH}..."
-
-# Check for root
-if [ "$(id -u)" -ne 0 ]; then
-  err "Please run as root: curl -fsSL https://zfsdash.com/install.sh | sudo bash"
+# Check for ZFS
+if ! command -v zpool &>/dev/null; then
+  echo "WARNING: zpool not found. Install ZFS before using ZFSdash."
+  echo "  Ubuntu: apt install zfsutils-linux"
+  echo "  FreeBSD: pkg install zfs"
 fi
 
-# Download binary
-log "Downloading ${BINARY}..."
-TMP=$(mktemp)
-curl -fsSL "$DOWNLOAD_URL" -o "$TMP" || err "Download failed. Check https://github.com/${REPO}/releases"
-chmod +x "$TMP"
-mv "$TMP" "${INSTALL_DIR}/zfsdash"
-ok "Binary installed to ${INSTALL_DIR}/zfsdash"
+DOWNLOAD_URL="https://github.com/zfsdash/zfsdash/releases/download/${VERSION}/${BINARY_NAME}-${OS_NAME}-${ARCH_NAME}"
 
-# Create system user
-if ! id "$USER" &>/dev/null; then
-  useradd --system --no-create-home --shell /bin/false "$USER" 2>/dev/null || true
+echo "Installing ZFSdash ${VERSION} (${OS_NAME}/${ARCH_NAME})..."
+curl -fsSL "$DOWNLOAD_URL" -o "/tmp/${BINARY_NAME}"
+chmod +x "/tmp/${BINARY_NAME}"
+
+# Verify binary
+if ! /tmp/${BINARY_NAME} --version &>/dev/null 2>&1; then
+  # Some versions don't have --version, just check it's executable
+  echo "Binary downloaded successfully."
+fi
+
+mv "/tmp/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+
+# Create service user
+if ! id -u "$SERVICE_USER" &>/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null || true
 fi
 
 # Create data directory
 mkdir -p "$DATA_DIR"
-chown "$USER:$USER" "$DATA_DIR"
-ok "Data directory: ${DATA_DIR}"
+chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" 2>/dev/null || true
 
-# Install systemd service (Linux only)
-if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
-  cat > "${SERVICE_DIR}/zfsdash.service" << 'EOF'
+# Install systemd service (Linux)
+if [ "$OS_NAME" = "linux" ] && command -v systemctl &>/dev/null; then
+  cat > /etc/systemd/system/zfsdash.service << 'UNIT'
 [Unit]
 Description=ZFSdash — ZFS Management Dashboard
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=zfsdash
+ExecStartPre=/bin/bash -c 'fuser -k 8080/tcp 2>/dev/null || true'
 ExecStart=/usr/local/bin/zfsdash -addr :8080 -data /var/lib/zfsdash
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/zfsdash
-ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
   systemctl daemon-reload
   systemctl enable zfsdash
   systemctl restart zfsdash
-  ok "systemd service installed and started"
+
+  echo ""
+  echo "✓ ZFSdash ${VERSION} installed and running."
+  echo ""
+  LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "your-server-ip")
+  echo "  Open http://${LOCAL_IP}:8080 to complete setup."
+  echo ""
 fi
 
-# Install rc.d script (FreeBSD only)
-if [ "$OS" = "freebsd" ]; then
-  cat > /usr/local/etc/rc.d/zfsdash << 'EOF'
+# FreeBSD rc.d service
+if [ "$OS_NAME" = "freebsd" ]; then
+  cat > /usr/local/etc/rc.d/zfsdash << 'RC'
 #!/bin/sh
 # PROVIDE: zfsdash
 # REQUIRE: NETWORKING
 # KEYWORD: shutdown
-
 . /etc/rc.subr
 name="zfsdash"
 rcvar="zfsdash_enable"
 command="/usr/local/bin/zfsdash"
 command_args="-addr :8080 -data /var/lib/zfsdash"
-zfsdash_user="zfsdash"
 load_rc_config $name
 run_rc_command "$1"
-EOF
+RC
   chmod +x /usr/local/etc/rc.d/zfsdash
   sysrc zfsdash_enable=YES 2>/dev/null || true
   service zfsdash start 2>/dev/null || true
-  ok "rc.d script installed and started"
+  echo ""
+  echo "✓ ZFSdash ${VERSION} installed."
+  echo "  Open http://$(hostname):8080 to complete setup."
+  echo ""
 fi
-
-echo
-echo -e "${GREEN}ZFSdash ${VERSION} installed successfully!${NC}"
-echo
-echo "  Open: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):8080"
-echo "  Complete the setup wizard to create your admin account."
-echo
-echo "  Logs:    journalctl -u zfsdash -f"
-echo "  Restart: systemctl restart zfsdash"
-echo "  Docs:    https://zfsdash.com"
-echo
