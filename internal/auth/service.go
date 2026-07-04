@@ -18,6 +18,9 @@ type Service struct {
 	store *db.Store
 }
 
+// New creates a new auth Service. Alias for NewService.
+func New(store *db.Store) *Service { return NewService(store) }
+
 // NewService creates a new auth Service.
 func NewService(store *db.Store) *Service {
 	return &Service{store: store}
@@ -48,7 +51,6 @@ func (s *Service) Login(username, password string) (string, error) {
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return "", fmt.Errorf("invalid credentials")
 	}
-	// Generate random token.
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate token: %w", err)
@@ -88,8 +90,6 @@ func (s *Service) Logout(token string) error {
 	return s.store.DeleteSessionByHash(hashToken(token))
 }
 
-// hashToken returns the SHA-256 hex digest of a plaintext session token.
-// Tokens are never stored in plaintext — only their hash is persisted.
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
