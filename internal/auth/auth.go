@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -14,8 +15,6 @@ import (
 const (
 	TokenLength     = 32
 	SessionDuration = 7 * 24 * time.Hour
-	RoleAdmin       = "admin"
-	RoleUser        = "user"
 )
 
 // Service manages authentication and sessions.
@@ -37,59 +36,62 @@ func generateToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// Login authenticates a user and creates a session.
-func (s *Service) Login(email, password string) (*db.Session, error) {
-	user, err := s.store.GetUserByEmail(email)
+// hashToken returns the SHA-256 hex hash of a plaintext token.
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// Login authenticates a user by username+password and creates a session.
+// Returns the plaintext session token (stored hashed in DB).
+func (s *Service) Login(username, password string) (string, *db.User, error) {
+	user, err := s.store.GetUserByUsername(username)
 	if err != nil {
-		return nil, fmt.Errorf("get user: %w", err)
+		return "", nil, fmt.Errorf("get user: %w", err)
 	}
-	if user == nil {
-		return nil, fmt.Errorf("invalid credentials")
+	if user == nil || !user.IsActive {
+		return "", nil, fmt.Errorf("invalid credentials")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return nil, fmt.Errorf("invalid credentials")
+		return "", nil, fmt.Errorf("invalid credentials")
 	}
 	token, err := generateToken()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	session := &db.Session{
-		ID:        uuid.New().String(),
-		UserID:    user.ID,
-		Token:     token,
-		ExpiresAt: time.Now().Add(SessionDuration),
-		CreatedAt: time.Now(),
+	sessID := uuid.New().String()
+	if err := s.store.CreateSessionByHash(sessID, user.ID, hashToken(token), time.Now().Add(SessionDuration)); err != nil {
+		return "", nil, fmt.Errorf("create session: %w", err)
 	}
-	if err := s.store.CreateSession(session); err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
-	}
-	return session, nil
+	_ = s.store.TouchLastLogin(user.ID)
+	return token, user, nil
 }
 
-// ValidateSession checks if a token is valid and not expired.
-func (s *Service) ValidateSession(token string) (*db.Session, error) {
-	session, err := s.store.GetSession(token)
+// ValidateSession validates a plaintext token and returns the session + user.
+func (s *Service) ValidateSession(token string) (*db.Session, *db.User, error) {
+	sess, err := s.store.GetSessionByHash(hashToken(token))
 	if err != nil {
-		return nil, fmt.Errorf("get session: %w", err)
+		return nil, nil, fmt.Errorf("get session: %w", err)
 	}
-	if session == nil {
-		return nil, fmt.Errorf("session not found")
+	if sess == nil {
+		return nil, nil, fmt.Errorf("session not found or expired")
 	}
-	if time.Now().After(session.ExpiresAt) {
-		_ = s.store.DeleteSession(token)
-		return nil, fmt.Errorf("session expired")
+	user, err := s.store.GetUserByID(sess.UserID)
+	if err != nil || user == nil {
+		return nil, nil, fmt.Errorf("user not found")
 	}
-	return session, nil
+	_ = s.store.TouchSessionActivity(sess.ID)
+	return sess, user, nil
 }
 
-// Logout deletes a session.
+// Logout invalidates a session by plaintext token.
 func (s *Service) Logout(token string) error {
-	return s.store.DeleteSession(token)
+	return s.store.DeleteSessionByHash(hashToken(token))
 }
 
-// CreateAdminUser creates a new admin user.
-func (s *Service) CreateAdminUser(email, name, password string) (*db.User, error) {
-	existing, err := s.store.GetUserByEmail(email)
+// CreateAdminUser creates the first admin user.
+func (s *Service) CreateAdminUser(username, email, password string) (*db.User, error) {
+	existing, err := s.store.GetUserByUsername(username)
 	if err != nil {
 		return nil, fmt.Errorf("check existing: %w", err)
 	}
@@ -100,16 +102,9 @@ func (s *Service) CreateAdminUser(email, name, password string) (*db.User, error
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
-	user := &db.User{
-		ID:           uuid.New().String(),
-		Email:        email,
-		Name:         name,
-		PasswordHash: string(hash),
-		Role:         RoleAdmin,
-		CreatedAt:    time.Now(),
-	}
-	if err := s.store.CreateUser(user); err != nil {
+	id := uuid.New().String()
+	if err := s.store.CreateUser(id, username, email, string(hash), true); err != nil {
 		return nil, fmt.Errorf("create user: %w", err)
 	}
-	return user, nil
+	return s.store.GetUserByID(id)
 }
