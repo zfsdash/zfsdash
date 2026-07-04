@@ -1,16 +1,17 @@
 [Unit]
-Description=ZFSdash — ZFS Management Dashboard
+Description=ZFSdash ZFS Monitoring Daemon
 After=network.target
 
 [Service]
 Type=simple
-User=root
-ExecStart=/usr/local/bin/zfsdash
+User=zfsdash
+Group=zfsdash
+WorkingDirectory=/opt/zfsdash
+ExecStart=/opt/zfsdash/zfsdash -addr :8080 -data /var/lib/zfsdash
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=zfsdash
+StandardOutput=append:/var/log/zfsdash/zfsdash.log
+StandardError=append:/var/log/zfsdash/zfsdash.log
 
 [Install]
 WantedBy=multi-user.target
