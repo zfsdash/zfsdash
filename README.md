@@ -1,244 +1,280 @@
 # ZFSdash
 
-<p align="center">
-  <img src="https://zfsdash.com/logo.svg" alt="ZFSdash" width="120" />
-</p>
+**Open source ZFS management dashboard.** Single binary. Runs on Linux and FreeBSD. No agents, no containers, no dependencies.
 
-<p align="center">
-  <strong>A lightweight, self-hosted ZFS management dashboard written in Go.</strong><br />
-  Monitor pools, datasets, and snapshots in real-time. Zero cloud. Zero accounts. Just ZFS.
-</p>
-
-<p align="center">
-  <a href="https://github.com/zfsdash/zfsdash/releases"><img src="https://img.shields.io/github/v/release/zfsdash/zfsdash?color=blue" alt="Latest Release" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-green" alt="License" /></a>
-  <a href="https://goreportcard.com/report/github.com/zfsdash/zfsdash"><img src="https://goreportcard.com/badge/github.com/zfsdash/zfsdash" alt="Go Report Card" /></a>
-</p>
+[![CI](https://github.com/zfsdash/zfsdash/actions/workflows/ci.yml/badge.svg)](https://github.com/zfsdash/zfsdash/actions/workflows/ci.yml)
+[![Release](https://github.com/zfsdash/zfsdash/actions/workflows/release.yml/badge.svg)](https://github.com/zfsdash/zfsdash/releases/latest)
+[![Go Report Card](https://goreportcard.com/badge/github.com/zfsdash/zfsdash)](https://goreportcard.com/report/github.com/zfsdash/zfsdash)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 ---
 
-## Features
-
-- **Pool health dashboard** — capacity, status, error counts at a glance
-- **Dataset tree view** — hierarchical drill-down with used/available/compression ratio
-- **Snapshot management** — create, browse, and destroy snapshots from the UI
-- **Scrub control** — start scrubs, monitor progress, view history
-- **SMART data** — disk health status per pool vdev
-- **Alert engine** — email + webhook notifications with configurable thresholds
-- **History tracking** — scrub runs and pool snapshots stored in SQLite
-- **Three backend modes** — local, SSH, TrueNAS REST API
-- **Multi-host** — manage multiple ZFS hosts from one dashboard
-- **Single binary** — no runtime dependencies, embeds the UI
-
----
-
-## Installation
-
-### Via `go install` (Recommended)
-
-Requires Go 1.21+.
+## Quick Install
 
 ```bash
+curl -fsSL https://zfsdash.com/install.sh | sudo bash
+```
+
+Or install a specific version:
+
+```bash
+ZFSDASH_VERSION=v0.1.0 curl -fsSL https://zfsdash.com/install.sh | sudo bash
+```
+
+## Manual Install
+
+```bash
+# Using go install
 go install github.com/zfsdash/zfsdash@latest
+
+# Or download a pre-built binary from GitHub Releases
+# https://github.com/zfsdash/zfsdash/releases/latest
 ```
 
-The binary lands at `$(go env GOPATH)/bin/zfsdash`. Make sure that's in your `$PATH`:
+## First Run
 
 ```bash
-export PATH=$PATH:$(go env GOPATH)/bin
+# Start the daemon (runs on :8080 by default)
+zfsdash
+
+# Or specify custom address and data directory
+zfsdash -addr :9090 -data /var/lib/zfsdash
+
+# Print version
+zfsdash -version
 ```
 
-### Building from Source
-
-```bash
-git clone https://github.com/zfsdash/zfsdash.git
-cd zfsdash
-go build -o zfsdash .
-./zfsdash -config config.yaml
-```
-
-### Docker
-
-```bash
-docker build -t zfsdash:latest .
-docker run -d \
-  --name zfsdash \
-  -p 8080:8080 \
-  -v /path/to/config.yaml:/etc/zfsdash/config.yaml:ro \
-  zfsdash:latest
-```
+Open `http://localhost:8080` to complete the setup wizard.
 
 ---
 
-## Quick Start
+## Modes
 
-### 1. Create a config file
+### Local
 
-**Local mode** — run ZFSdash directly on your ZFS host:
+Manages ZFS on the host where ZFSdash runs. Requires ZFS utilities (`zpool`, `zfs`) on the same machine.
 
-```yaml
-# config.yaml
-server:
-  bind: "0.0.0.0:8080"
-
-hosts:
-  - name: local
-    mode: local
+```
+zfsdash
+# → Setup wizard → choose "Local" → done
 ```
 
-Then open **http://localhost:8080** in your browser. Done.
+### SSH
 
-### 2. Start ZFSdash
+Connects to a remote host over SSH and runs ZFS commands remotely. The remote host needs ZFS utilities installed — ZFSdash itself does not need to run there.
+
+```
+# Configure via the setup wizard or API:
+POST /api/hosts
+{
+  "mode": "ssh",
+  "host": "192.168.1.10",
+  "port": 22,
+  "user": "root",
+  "private_key": "..."
+}
+```
+
+### TrueNAS SCALE / CORE
+
+Connects to a TrueNAS instance via its REST API. No SSH required.
+
+```
+POST /api/hosts
+{
+  "mode": "truenas",
+  "host": "192.168.1.20",
+  "api_key": "your-truenas-api-key"
+}
+```
+
+### Agent (Cloud Dashboard)
+
+ZFSdash can run in agent mode, phoning home to [app.zfsdash.com](https://app.zfsdash.com) for a cloud-hosted dashboard with multi-host support, alerting, and AI-powered predictions.
 
 ```bash
-zfsdash -config config.yaml
+# Register and start agent mode
+zfsdash agent --token YOUR_TOKEN
+
+# Or set via environment
+ZFSDASH_AGENT_TOKEN=YOUR_TOKEN zfsdash agent
+```
+
+The agent collects pool health, capacity, dataset stats, and SMART data every 60 seconds, sending telemetry to `app.zfsdash.com` over HTTPS. It uses exponential backoff for all network calls and continues local operation if the cloud is unreachable.
+
+---
+
+## Setup Wizard API
+
+On first run, ZFSdash walks you through setup via the web UI. You can also drive it programmatically:
+
+```bash
+# Check setup status
+GET /api/setup/status
+# → {"needsSetup": true, "step": "admin"}
+
+# Create first admin account
+POST /api/setup/admin
+{"email": "admin@example.com", "password": "..."}
+
+# Add first host
+POST /api/setup/host
+{"mode": "local"}
+
+# Mark setup complete
+POST /api/setup/complete
+
+# Check ZFS availability
+GET /api/setup/check-zfs
+# → {"available": true, "version": "2.2.2", "pools": 3}
 ```
 
 ---
 
 ## Configuration
 
-Full example with all three modes:
+ZFSdash is configured via command-line flags and environment variables:
 
-```yaml
-# config.yaml
-server:
-  bind: "0.0.0.0:8080"
-  read_only: false  # set true to disable write operations
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `-addr` | `ZFSDASH_ADDR` | `:8080` | HTTP listen address |
+| `-data` | `ZFSDASH_DATA_DIR` | `/var/lib/zfsdash` | SQLite database directory |
+| `-version` | — | — | Print version and exit |
 
-database:
-  path: "/var/lib/zfsdash/zfsdash.db"  # SQLite history database
+When run as a non-root user, the data directory defaults to `~/.zfsdash`.
 
-alerts:
-  capacity_threshold: 85  # alert when pool used% exceeds this
-  check_interval: "5m"
-  email:
-    enabled: false
-    smtp_host: "smtp.example.com"
-    smtp_port: 587
-    from: "zfsdash@example.com"
-    to: "admin@example.com"
-    username: "zfsdash@example.com"
-    password: "yourpassword"
-  webhook:
-    enabled: false
-    url: "https://hooks.slack.com/services/..."
-    cooldown: "1h"
+### systemd (Linux)
 
-hosts:
-  # Mode 1: Local — ZFSdash runs ON the ZFS host
-  - name: local
-    mode: local
+The installer creates `/etc/systemd/system/zfsdash.service`. Customize via `/etc/zfsdash/config.env`:
 
-  # Mode 2: SSH — ZFSdash connects to a remote ZFS host
-  - name: nas-01
-    mode: ssh
-    host: "192.168.1.100"
-    port: 22
-    user: "root"
-    private_key: "/root/.ssh/id_ed25519"
-
-  # Mode 3: TrueNAS REST API
-  - name: truenas-main
-    mode: truenas
-    url: "https://truenas.local"
-    api_key: "1-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    verify_ssl: false
+```env
+ZFSDASH_ADDR=:8080
+ZFSDASH_DATA_DIR=/var/lib/zfsdash
 ```
-
----
-
-## Systemd Service
-
-To run ZFSdash as a system service:
 
 ```bash
-# Copy binary
-sudo cp zfsdash /usr/local/bin/zfsdash
-
-# Create config directory
-sudo mkdir -p /etc/zfsdash
-sudo cp config.yaml /etc/zfsdash/config.yaml
-
-# Create data directory
-sudo mkdir -p /var/lib/zfsdash
-
-# Create service user
-sudo useradd -r -s /bin/false zfsdash
-sudo chown -R zfsdash:zfsdash /var/lib/zfsdash
-
-# Install the service
-sudo cp zfsdash.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now zfsdash
+systemctl status zfsdash
+journalctl -u zfsdash -f
 ```
 
-**zfsdash.service:**
+### rc.d (FreeBSD)
 
-```ini
-[Unit]
-Description=ZFSdash — ZFS Management Dashboard
-After=network.target
+The installer creates `/etc/rc.d/zfsdash`. Configure in `/etc/rc.conf`:
 
-[Service]
-Type=simple
-User=zfsdash
-ExecStart=/usr/local/bin/zfsdash -config /etc/zfsdash/config.yaml
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+```sh
+zfsdash_enable="YES"
+zfsdash_addr=":8080"
+zfsdash_data="/var/lib/zfsdash"
 ```
-
----
-
-## API
-
-ZFSdash exposes a REST API at `/api/`:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/health` | Health check |
-| `GET` | `/api/hosts` | List all configured hosts |
-| `GET` | `/api/hosts/{host}/pools` | List pools on a host |
-| `GET` | `/api/hosts/{host}/pools/{pool}/datasets` | List datasets |
-| `GET` | `/api/hosts/{host}/pools/{pool}/snapshots` | List snapshots |
-| `POST` | `/api/hosts/{host}/pools/{pool}/snapshots` | Create snapshot |
-| `DELETE` | `/api/hosts/{host}/pools/{pool}/snapshots/{snap}` | Destroy snapshot |
-| `POST` | `/api/hosts/{host}/pools/{pool}/scrub` | Start scrub |
-| `GET` | `/api/hosts/{host}/pools/{pool}/history` | Scrub history |
-| `GET` | `/api/hosts/{host}/smart` | SMART disk data |
-
----
-
-## Enterprise
-
-ZFSdash is free and open source under AGPL-3.0.
-
-An **Enterprise edition** with AI-powered disk failure prediction, anomaly detection, Slack/PagerDuty integrations, RBAC, and SSO is coming soon.
-
-→ [Learn more at zfsdash.com](https://zfsdash.com)
-
----
-
-## Contributing
-
-Pull requests welcome. Please open an issue first for major changes.
 
 ```bash
-git clone https://github.com/zfsdash/zfsdash.git
-cd zfsdash
-go test ./...
-go build .
+service zfsdash status
+service zfsdash restart
 ```
+
+---
+
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux x86_64 | ✅ Supported | Ubuntu 20.04+, Debian 11+, RHEL 8+ |
+| Linux arm64 | ✅ Supported | Raspberry Pi 4+, AWS Graviton |
+| FreeBSD amd64 | ✅ Supported | FreeBSD 13.0+ |
+| macOS | 🧪 Experimental | For development only (no production ZFS) |
 
 ---
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE) for details.
+ZFSdash is open source under the [AGPL-3.0 license](LICENSE).
 
-Sponsored by [ThoughtWave](https://thoughtwave.com).
+Enterprise features (Slack/PagerDuty alerts, RBAC, AI predictions, audit log) are available at [zfsdash.com](https://zfsdash.com) with a commercial license key.
+
+### License Key Format
+
+Enterprise keys use the format `ZFS-XXXX-XXXX-XXXX-XXXX`. The daemon validates keys against `app.zfsdash.com` once per 24 hours and caches the result locally — offline operation continues for up to 24 hours if the server is unreachable.
+
+```bash
+# Set via environment
+ZFSDASH_LICENSE_KEY=ZFS-XXXX-XXXX-XXXX-XXXX zfsdash
+
+# Or via the web UI: Settings → License
+```
+
+---
+
+## Development
+
+```bash
+# Clone
+git clone https://github.com/zfsdash/zfsdash
+cd zfsdash
+
+# Run tests
+go test ./...
+
+# Build
+go build -o zfsdash .
+
+# Cross-compile
+GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -o zfsdash-freebsd-amd64 .
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o zfsdash-linux-arm64 .
+
+# Run locally (non-root, uses ~/.zfsdash as data dir)
+./zfsdash -addr :8080
+```
+
+### Architecture
+
+```
+├── main.go                    # Entry point, HTTP server, signal handling
+├── internal/
+│   ├── agent/                 # Agent mode — telemetry to app.zfsdash.com
+│   │   ├── agent.go           # Agent struct, Register(), Run(), backoff logic
+│   │   └── collector.go       # Adapts zfs.LocalCollector for telemetry
+│   ├── alerts/                # Alert rule evaluation and dispatch
+│   ├── auth/                  # Session management, bcrypt password hashing
+│   ├── config/                # Runtime configuration
+│   ├── db/                    # SQLite schema, migrations, Store type
+│   ├── license/               # License validation with offline cache
+│   ├── platform/              # OS detection helpers
+│   ├── store/                 # In-memory ZFS data cache
+│   ├── web/                   # HTTP handlers, static file serving
+│   ├── wizard/                # First-run setup state detection
+│   └── zfs/                   # ZFS data collection (local, SSH, TrueNAS)
+│       ├── local.go           # LocalCollector — shells out to zpool/zfs
+│       ├── ssh.go             # SSHCollector — runs ZFS commands over SSH
+│       ├── truenas.go         # TrueNASCollector — TrueNAS REST API client
+│       ├── platform.go        # Platform-specific binary path resolution
+│       └── types.go           # Pool, Dataset, SMART types
+├── install.sh                 # One-liner installer (Linux + FreeBSD)
+└── scripts/
+    └── zfsdash.rc             # FreeBSD rc.d service script
+```
+
+### Contributing
+
+Pull requests welcome. Run `go vet ./...` and `go test ./...` before submitting. The CI pipeline checks all three target platforms on every push.
+
+---
+
+## FAQ
+
+**Q: Does ZFSdash require root?**  
+A: For local mode, yes — `zpool` and `zfs` require root or `ZFS_ALLOW` delegation. For SSH mode, the configured SSH user needs ZFS access on the remote host. For TrueNAS, no root needed — just an API key.
+
+**Q: Does it work with OpenZFS 2.x on Linux?**  
+A: Yes. ZFSdash shells out to the installed `zpool`/`zfs` binaries and parses their output. It works with OpenZFS 2.0 through 2.2+.
+
+**Q: Is there a Docker image?**  
+A: Not yet — ZFSdash needs access to the host's ZFS devices, which is awkward in containers. The single binary + systemd service is the recommended deployment.
+
+**Q: What database does it use?**  
+A: SQLite (via `modernc.org/sqlite`, pure Go, no CGO). The database file lives in the data directory (`/var/lib/zfsdash/zfsdash.db`).
+
+**Q: How do I upgrade?**  
+A: Run the installer again — it downloads the latest binary and restarts the service:
+```bash
+curl -fsSL https://zfsdash.com/install.sh | sudo bash
+```

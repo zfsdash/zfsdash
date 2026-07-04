@@ -1,0 +1,80 @@
+#!/bin/sh
+# PROVIDE: zfsdash
+# REQUIRE: NETWORKING LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable zfsdash:
+#   zfsdash_enable="YES"
+#   zfsdash_addr=":8080"          # optional, default :8080
+#   zfsdash_data="/var/lib/zfsdash"  # optional
+
+. /etc/rc.subr
+
+name="zfsdash"
+rcvar="zfsdash_enable"
+desc="ZFSdash ZFS Management Dashboard"
+command="/usr/local/bin/zfsdash"
+command_interpreter="/usr/local/bin/zfsdash"
+pidfile="/var/run/${name}.pid"
+
+load_rc_config "${name}"
+
+: ${zfsdash_enable:="NO"}
+: ${zfsdash_addr:=":8080"}
+: ${zfsdash_data:="/var/lib/zfsdash"}
+: ${zfsdash_user:="zfsdash"}
+: ${zfsdash_group:="zfsdash"}
+
+command_args="-addr ${zfsdash_addr} -data ${zfsdash_data}"
+
+start_precmd="${name}_prestart"
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+status_cmd="${name}_status"
+
+zfsdash_prestart() {
+    # Create data directory if absent
+    if [ ! -d "${zfsdash_data}" ]; then
+        install -d -o "${zfsdash_user}" -g "${zfsdash_group}" -m 750 "${zfsdash_data}"
+    fi
+    # Create run directory
+    if [ ! -d /var/run ]; then
+        mkdir -p /var/run
+    fi
+    return 0
+}
+
+zfsdash_start() {
+    echo "Starting ${name}."
+    /usr/sbin/daemon \
+        -u "${zfsdash_user}" \
+        -p "${pidfile}" \
+        -f \
+        ${command} ${command_args}
+}
+
+zfsdash_stop() {
+    if [ -f "${pidfile}" ]; then
+        pid="$(cat "${pidfile}")"
+        echo "Stopping ${name} (pid ${pid})."
+        kill -TERM "${pid}" 2>/dev/null || true
+        wait_for_pids "${pid}"
+        rm -f "${pidfile}"
+    else
+        echo "${name} is not running."
+    fi
+}
+
+zfsdash_status() {
+    if [ -f "${pidfile}" ]; then
+        pid="$(cat "${pidfile}")"
+        if kill -0 "${pid}" 2>/dev/null; then
+            echo "${name} is running as pid ${pid}."
+            return 0
+        fi
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"
