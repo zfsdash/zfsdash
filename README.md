@@ -1,9 +1,12 @@
 # ZFSdash
 
-**Open source ZFS management dashboard. Single binary. No cloud required.**
+**Open source ZFS management dashboard. Single Go binary. No Docker. No config files.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/zfsdash/zfsdash)](https://github.com/zfsdash/zfsdash/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20FreeBSD-lightgrey)](#)
+
+![ZFSdash Dashboard](https://zfsdash.com/screenshot.png)
 
 ## Install
 
@@ -11,72 +14,129 @@
 curl -fsSL https://zfsdash.com/install.sh | sudo bash
 ```
 
-Open **http://localhost:8080** — the setup wizard walks you through everything. No config files.
+Then open `http://your-server:8080` — a setup wizard walks you through the rest. No config file required.
 
-### Manual
+### Direct Download
 
-```bash
-# Linux amd64
-curl -fsSL https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash-linux-amd64 \
-  -o /usr/local/bin/zfsdash && chmod +x /usr/local/bin/zfsdash && zfsdash serve
-
-# FreeBSD amd64
-curl -fsSL https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash-freebsd-amd64 \
-  -o /usr/local/bin/zfsdash && chmod +x /usr/local/bin/zfsdash && zfsdash serve
-```
+| Platform | Binary |
+|---|---|
+| Linux amd64 | [zfsdash-linux-amd64](https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash-linux-amd64) |
+| Linux arm64 | [zfsdash-linux-arm64](https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash-linux-arm64) |
+| FreeBSD amd64 | [zfsdash-freebsd-amd64](https://github.com/zfsdash/zfsdash/releases/latest/download/zfsdash-freebsd-amd64) |
 
 ## Features
 
-- **Pool health** — ONLINE/DEGRADED/FAULTED at a glance
-- **Capacity tracking** — used/available with history
-- **Dataset & snapshot management** — create, clone, rollback, destroy
-- **Scrub scheduling** — start and track progress
-- **SMART monitoring** — drive health, temperature, error counts
-- **Alerting** — email and webhook for degraded pools and low capacity
-- **Multi-host** — manage ZFS on many servers from one dashboard
-- **Setup wizard** — no config files needed, configure everything in the browser
+- **Pool health monitoring** — ONLINE / DEGRADED / FAULTED status, capacity bars, error counts
+- **Dataset tree** — used/avail/refer columns, compression ratio, mountpoint
+- **Snapshot management** — create, clone, destroy, rollback
+- **Scrub control** — start/stop scrubs, full scrub history
+- **SMART data** — per-drive temperature, reallocated sectors, power-on hours
+- **Alerts** — email + webhook, configurable thresholds, cooldown periods
+- **Multi-host** — local `zpool`, SSH to remote hosts, TrueNAS REST API
+- **Setup wizard** — first-run browser wizard, no config files needed
+- **SQLite** — local history, no external database required
 
-## Connection Modes
+## How It Works
 
-| Mode | How it works |
-|------|-------------|
-| **Local** | Runs `zpool`/`zfs` on the same machine |
-| **SSH** | Connects via SSH to a remote host |
-| **TrueNAS** | Uses the TrueNAS REST API |
-
-## ZFSdash Cloud
-
-Don't want to self-host? [app.zfsdash.com](https://app.zfsdash.com) hosts the dashboard for you.
-
-Install the agent on your ZFS hosts:
-
-```bash
-ZFSDASH_TOKEN=your_token zfsdash agent
+```
+zfsdash binary
+  ├── Embedded web UI (Next.js static export)
+  ├── ZFS collectors (local / SSH / TrueNAS REST)
+  ├── SQLite database (history, users, config)
+  ├── Alert engine (email + webhook)
+  └── Setup wizard (first-run only)
 ```
 
-$19/month. Cancel anytime.
+One binary. One port. Zero external dependencies.
 
-## Enterprise ($49/mo)
+## Comparison
 
-- Unlimited users + RBAC
-- LDAP/SSO
-- Slack, PagerDuty, Opsgenie alerts
-- Audit log
-- SLA support
+| Feature | ZFSdash | TrueNAS SCALE | Proxmox + ZFS | Grafana + ZFS plugin |
+|---|---|---|---|---|
+| Single binary install | ✅ | ❌ Full OS | ❌ Full OS | ❌ Multiple services |
+| Works on existing Linux | ✅ | ❌ Replaces OS | ❌ Replaces OS | ✅ |
+| Works on existing FreeBSD | ✅ | ✅ (CORE only) | ❌ | ✅ |
+| No Docker required | ✅ | ❌ | ❌ | ❌ |
+| Browser setup wizard | ✅ | ✅ | ❌ | ❌ |
+| Pool health dashboard | ✅ | ✅ | ✅ | ✅ |
+| Snapshot management | ✅ | ✅ | ✅ | ❌ |
+| SMART data | ✅ | ✅ | ✅ | ✅ |
+| Scrub scheduling | ✅ | ✅ | ❌ | ❌ |
+| SSH to remote hosts | ✅ | ❌ | ❌ | ✅ |
+| TrueNAS API support | ✅ | — | ❌ | ❌ |
+| Open source | ✅ AGPL | ✅ BSL | ✅ AGPL | ✅ Apache |
+| Binary size | 12 MB | ~5 GB | ~2 GB | ~500 MB |
+| Memory usage | ~3 MB | ~4 GB | ~1 GB | ~500 MB |
 
-[zfsdash.com/pricing](https://zfsdash.com/pricing)
+## Configuration Modes
 
-## Build from Source
+### Local (default)
+Monitors ZFS pools on the host where ZFSdash is running.
+
+### SSH
+Connects to remote Linux/FreeBSD hosts via SSH. No agent required on the remote host.
+
+```yaml
+hosts:
+  - name: storage-box
+    mode: ssh
+    host: 192.168.1.100
+    user: root
+    key: /home/admin/.ssh/id_ed25519
+```
+
+### TrueNAS REST API
+Connects to TrueNAS SCALE or CORE via the REST API.
+
+```yaml
+hosts:
+  - name: my-truenas
+    mode: truenas
+    url: https://truenas.local
+    api_key: 1-abcdef123456
+```
+
+## Alerts
+
+Configure email or webhook alerts:
+
+```yaml
+alerts:
+  - name: pool-usage-critical
+    condition: pool_used_percent > 85
+    webhook: https://hooks.slack.com/services/...
+    cooldown: 24h
+  - name: pool-degraded
+    condition: pool_health != ONLINE
+    email: admin@example.com
+```
+
+## Roadmap (v0.2)
+
+- [ ] Capacity forecast ("full in X days")
+- [ ] One-click snapshot clone to temp dataset
+- [ ] Scrub scheduling UI
+- [ ] Dataset I/O stats (read/write MB/s)
+- [ ] Prometheus `/metrics` endpoint
+- [ ] FreeBSD rc.d service file
+
+See [open issues](https://github.com/zfsdash/zfsdash/issues) to contribute.
+
+## Cloud
+
+Manage multiple ZFS hosts from a single hosted dashboard at [app.zfsdash.com](https://app.zfsdash.com).
+
+## License
+
+[AGPL-3.0](LICENSE) — free for self-hosted use. [Enterprise license](https://app.zfsdash.com/billing) available for commercial deployments requiring SSO, RBAC, and SLA-backed support.
+
+## Contributing
+
+PRs welcome. Check [open issues](https://github.com/zfsdash/zfsdash/issues) for good first contributions.
 
 ```bash
 git clone https://github.com/zfsdash/zfsdash
 cd zfsdash
-go build -o zfsdash .
-./zfsdash serve
+go build ./...
+go test ./...
 ```
-
-Requires Go 1.22+.
-
-## License
-
-AGPL-3.0. See [LICENSE](LICENSE).
