@@ -324,3 +324,23 @@ func parseSMARTJSON(data []byte, device string) *SMARTData {
 		Timestamp:    time.Now(),
 	}
 }
+
+// ParseDatasets parses zfs list output into Dataset slice
+func ParseDatasets(pool string) ([]*Dataset, error) {
+	out, err := exec.Command("zfs", "list", "-t", "filesystem,volume",
+		"-H", "-p", "-o", "name,type,used,avail,refer,mountpoint", "-r", pool).Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseDatasetList(out)
+}
+
+// ParseSnapshots parses zfs list snapshot output
+func ParseSnapshots(dataset string) ([]*Snapshot, error) {
+	out, err := exec.Command("zfs", "list", "-t", "snapshot",
+		"-H", "-p", "-o", "name,used,refer,creation", "-r", dataset).Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseSnapshotList(out)
+}

@@ -80,4 +80,12 @@ func SetupRoutes(r chi.Router, h *Handler, staticFS fs.FS) {
 
 	// Static files
 	r.Handle("/*", http.FileServer(http.FS(staticFS)))
+
+	// DLQ — Silent failure detection
+	r.Get("/api/dlq/events", h.handleDLQEvents)
+	r.Post("/api/dlq/events/{id}/acknowledge", h.handleDLQAcknowledge)
+
+	// Zvol health
+	r.Get("/api/pools/{pool}/zvols", h.handleZvolHealth)
+	r.Get("/api/pools/{pool}/capacity-risk", h.handleZvolCapacityRisk)
 }
